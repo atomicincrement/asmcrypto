@@ -1,0 +1,23 @@
+[package]
+name = "asmcrypto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+# alloy-consensus Keccak backends
+sha3 = "0.10"
+tiny-keccak = { version = "2", features = ["keccak"] }
+# alloy-consensus ECDSA backends
+k256 = { version = "0.13", features = ["ecdsa"] }
+secp256k1 = { version = "0.29", features = ["recovery", "global-context"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[[bench]]
+name = "keccak"
+harness = false
+
+[[bench]]
+name = "ecdsa"
+harness = false
