@@ -200,3 +200,56 @@ a complete GLV+wNAF Shamir simultaneous scalar multiplication:
 - `LAMBDA = 0xac9c52b33fa3cf1f5ad9e3fd77ed9ba4a880b9fc8ec739c2e0cfc810b51283ce`
 
 All 10 tests pass.
+
+---
+
+## 2026-03-18 — perf profiling of ECDSA hotspots
+
+### Prompt
+> Run perf on the asmcrypto ecdsa to identify hotspots.
+
+### High-level effects
+
+Added `examples/perf_ecdsa.rs` — a 50 000-iteration tight loop over
+`recover_address` with a 200-call warm-up, suitable for `perf record`.
+
+Profiled on: **AMD Ryzen 9 9955HX** (Zen 5).  
+Available ISA extensions of interest: **ADX** (MULX/ADCX/ADOX), **AVX-512 IFMA**
+(`VPMADD52LU/HU`), BMI1/BMI2, AVX-512BW/DQ/VL, SHA_NI.
+
+#### Flat profile (self time, 3096 samples, `perf record -g --call-graph dwarf -F 997`)
+
+| Self % | Samples | Function |
+|---|---|---|
+| **68.3%** | 2092 | `asmcrypto::ecdsa::fp_mul` |
+| 12.6% | 380 | `asmcrypto::ecdsa::point_double` |
+| 11.5% | 351 | `asmcrypto::ecdsa::fn_mul` |
+| 3.6% | 110 | `asmcrypto::ecdsa::point_add` |
+| 1.5% | 44 | `asmcrypto::ecdsa::scalar_mul_glv_wnaf` |
+| 1.0% | 28 | `asmcrypto::ecdsa::JacobianPoint::to_affine` |
+
+#### Interpretation
+
+`fp_mul` alone consumes 68% of cycles. Its inner loop is a 4×4 schoolbook
+`mul_wide` (16 × `MUL` instructions) followed by a two-round Solinas reduction.
+The `point_double` and `point_add` percentages are mostly `fp_mul` calls reported
+at the call-site (LLVM inlines lightly here). `fn_mul` (scalar-field mod n) uses
+the same schoolbook core.
+
+#### Optimisation targets, in priority order
+
+1. **`fp_mul` (68%)** — replace `mul_wide` schoolbook with an ADX-accelerated
+   implementation using `MULX`/`ADCX`/`ADOX`. These instructions decouple the
+   multiply output from CF/OF, enabling full pipelining of the carry chain.
+   Alternative: `VPMADD52LU`/`VPMADD52HU` (AVX-512 IFMA) for a 52-bit multiply
+   accumulate approach used by e.g. OpenSSL's P-256 assembly.
+
+2. **`fn_mul` (11.5%)** — same treatment; both share `mul_wide`.
+
+3. **Jacobian formula reduction** — `point_double` costs ~8 `fp_mul` + 4 `fp_sq`;
+   `point_add` costs ~11 `fp_mul` + 2 `fp_sq`. Switching to add-2008-bj
+   (dedicated doubling formula) or a Z=1 mixed-add path would reduce call count.
+
+4. **`to_affine` (1%)** — one modular inversion (254-step exponentiation).
+   Batching inversions across multiple signature verifications (Montgomery's
+   trick) would amortise this cost.
