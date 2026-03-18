@@ -24,3 +24,7 @@ harness = false
 [[bench]]
 name = "ecdsa"
 harness = false
+
+[[bench]]
+name = "mul_wide"
+harness = false

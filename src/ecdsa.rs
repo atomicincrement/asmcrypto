@@ -1453,6 +1453,30 @@ pub fn recover_address(hash: &[u8; 32], r: &[u8; 32], s: &[u8; 32], v: u8) -> Op
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Benchmark helpers
+// ─────────────────────────────────────────────────────────────────────────────
+// Thin public wrappers over the private multiply kernels so that the benches/
+// crate can call them without U256 being part of the public API.
+
+/// 256×256→512 using the generic schoolbook loop.
+#[doc(hidden)]
+pub fn bench_mul_wide_generic(a: [u64; 4], b: [u64; 4]) -> [u64; 8] {
+    mul_wide_generic(&U256(a), &U256(b))
+}
+
+/// 256×256→512 using the ADX MULX/ADCX/ADOX path.
+#[doc(hidden)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "bmi2",
+    target_feature = "adx"
+))]
+pub fn bench_mul_wide_adx(a: [u64; 4], b: [u64; 4]) -> [u64; 8] {
+    // SAFETY: cfg guard ensures BMI2 + ADX are present.
+    unsafe { mul_wide_adx(&U256(a), &U256(b)) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
