@@ -446,3 +446,46 @@ The ECDSA improvement comes entirely from faster squarings: `fp_sq` is called
 in `point_double`, `fp_inv`, `fp_sqrt`, and the main scalar-multiplication loop.
 
 **Build:** 10/10 tests pass, zero warnings.
+
+---
+
+## Session 5n — `ecdsa_clone`: 5×52-bit field, all 11 tests passing
+
+### Prompt
+> "make a new module ecdsa_clone that is an exact translation of the C code.
+> Reference the path to each C function on my local machine in the comments."
+> (followed by several debugging sessions to fix bugs in the translation)
+
+### High-level effects
+
+**New `src/ecdsa_clone.rs`** (~1550 lines): a direct Rust translation of
+`libsecp256k1`'s 5×52-bit field-element representation and group operations,
+each function cross-referenced to its C source by comment.
+
+**Structures mirroring the C types:**
+- `Fe { n: [u64; 5] }` — 5×52-bit packed field element
+- `Scalar { d: [u64; 4] }` — 256-bit group scalar (little-endian)
+- `Ge / Gej` — affine and Jacobian secp256k1 points
+
+**Bugs found and fixed during translation:**
+
+1. **`scalar_inverse_var` limb-iteration order** — binary square-and-multiply
+   must iterate MSB-first within each 64-bit word.
+
+2. **`N_C_0` constant** — the N-complement limb 0 was off by 1:
+   correct form is `N_0.wrapping_neg()`.
+
+3. **`fe_inv` used wrong modulus** — used scalar n−2 instead of field prime p−2.
+   Fixed: binary square-and-multiply over
+   `[0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFEFFFFFC2D]`.
+
+4. **`fe_half` used `|` instead of `+`** — the critical bug. The C source
+   writes `(t1 >> 1) + ((t2 & one) << 51)`. For magnitude ≥ 2 inputs,
+   `t1 >> 1` can already have bit 51 set; `|` then silently discards the carry,
+   producing a result wrong by `2^155 + 2^207`. Using `+` propagates the carry
+   correctly. This caused `gej_double` to return the wrong x-coordinate for 2G.
+
+**`test_ecrecover_clone`:** recovers Ethereum address
+`7156526fbd7a3c72969b54f64e42c10fbb768c8a` from a known secp256k1 signature.
+
+**Build:** 21/21 tests pass (11 ecdsa_clone + 4 keccak + 6 ecdsa), zero errors.
