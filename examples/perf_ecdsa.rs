@@ -31,12 +31,14 @@ fn main() {
     // Profile loop — ~3 seconds at 60 µs/call
     let n = 50_000usize;
     let mut sink = [0u8; 20];
+    let t0 = std::time::Instant::now();
     for _ in 0..n {
         sink = asmcrypto::ecdsa::recover_address(&hash, &r, &s, v).unwrap_or([0u8; 20]);
     }
+    let us = t0.elapsed().as_nanos() as f64 / n as f64 / 1_000.0;
+    println!("asmcrypto recover_address: {us:.2} µs/call  ({n} iters)");
     // Prevent dead-code elimination
     if sink[0] == 0xff {
         eprintln!("(should not print)");
     }
-    println!("Done {} iterations", n);
 }
