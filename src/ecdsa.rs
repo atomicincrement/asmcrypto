@@ -1391,6 +1391,12 @@ pub fn bench_fp_reduce_wide(w: [u64; 8]) -> [u64; 4] {
     fp_reduce_wide(&w).0
 }
 
+/// Compute a field multiplication mod n (mul_wide + unrolled reduction).
+#[doc(hidden)]
+pub fn bench_fp_mul(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
+    fp_mul(&U256(a), &U256(b)).0
+}
+
 /// Compute a scalar multiplication mod n (mul_wide + unrolled reduction).
 #[doc(hidden)]
 pub fn bench_fn_mul(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
