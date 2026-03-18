@@ -489,3 +489,51 @@ each function cross-referenced to its C source by comment.
 `7156526fbd7a3c72969b54f64e42c10fbb768c8a` from a known secp256k1 signature.
 
 **Build:** 21/21 tests pass (11 ecdsa_clone + 4 keccak + 6 ecdsa), zero errors.
+
+---
+
+## Session 5o — `ecdsa_clone`: Strauss wNAF + GLV ecmult; 44.7 µs/call
+
+### Prompt
+> "Can we try the Strauss wNAF algorithm with precomputed tables as in the C version?"
+
+### High-level effects
+
+**Replaced naive double-and-add `ecmult` with a faithful port of `ecmult_impl.h`:**
+
+New functions added to `src/ecdsa_clone.rs`:
+
+| Function | C source | Purpose |
+|---|---|---|
+| `scalar_get_bits(s, pos, len)` | `ecmult_impl.h` | bit-range extraction for wNAF |
+| `scalar_mul_shift_384(a, b)` | `scalar_4x64_impl.h` `scalar_mul_shift_var` | (a·b)>>384, round to nearest |
+| `scalar_split_lambda(k)` | `scalar_impl.h` | GLV: r1+λ·r2=k, both ~128 bit |
+| `scalar_split_128(k)` | `scalar_4x64_impl.h` | lo128 / hi128 split for G scalar |
+| `ecmult_wnaf(s, w=5)` | `ecmult_impl.h` | signed windowed NAF |
+| `build_odd_multiples_table(a)` | `ecmult_impl.h` | {P,3P,...,15P} via single field-inversion (Montgomery batch trick) |
+| `table_get_ge / table_get_ge_lambda` | `ecmult_impl.h` | table lookup with automatic negation for negative NAF digits |
+| `g_tables()` OnceLock | – | cache G and 2¹²⁸·G tables globally (built once per process) |
+
+**GLV decomposition constants (from `scalar_impl.h`):**
+- λ = cube root of 1 mod n: `5363AD4C...1B23BD72`
+- β = cube root of 1 mod p: `7ae96a2b...719501ee`
+- g1, g2, minus_b1, minus_b2: lattice basis for algorithm 3.74
+
+**Algorithm:**
+1. Split `u2` (A scalar) via GLV → `na_1 + λ·na_lam`, both ~128 bits
+2. Split `u1` (G scalar) simply → `ng_1 = lo128`, `ng_128 = hi128`
+3. Build affine table `{A, 3A, ..., 15A}` with Montgomery batch-inversion (1 fe_inv + 22 fe_muls)
+4. Build `aux` table = `{β·Ax, β·3Ax, ...}` for the λ-twisted lookups
+5. Fetch cached tables for G and 2¹²⁸·G (computed once via `OnceLock`)
+6. Convert all 4 scalars to wNAF (window 5, ≤ 129 bits each)
+7. Main loop: ≤ 129 doublings + ≤ 4 × 26 = 104 affine additions
+
+**Performance (50 000 iterations, `--release`):**
+
+| Variant | Time | vs previous |
+|---|---|---|
+| `ecdsa` (4×64 Solinas) | 53 µs | — |
+| `ecdsa_clone` naive double-and-add | 69 µs | baseline |
+| `ecdsa_clone` Strauss wNAF + GLV | **45 µs** | 35% faster, 16% faster than Solinas |
+
+**Build:** 21/21 tests pass, zero errors.
