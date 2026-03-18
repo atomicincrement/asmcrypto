@@ -23,22 +23,51 @@ fn main() {
     ];
     let v = 1u8;
 
-    // Warm up
+    // Build sig65 for ecdsa_clone: r || s || v
+    let mut sig65 = [0u8; 65];
+    sig65[0..32].copy_from_slice(&r);
+    sig65[32..64].copy_from_slice(&s);
+    sig65[64] = v;
+
+    let n = 50_000usize;
+    let mut sink = [0u8; 20];
+
+    // ── ecdsa (4×64-bit Solinas) ──────────────────────────────────────────────
     for _ in 0..200 {
         let _ = asmcrypto::ecdsa::recover_address(&hash, &r, &s, v);
     }
-
-    // Profile loop — ~3 seconds at 60 µs/call
-    let n = 50_000usize;
-    let mut sink = [0u8; 20];
     let t0 = std::time::Instant::now();
     for _ in 0..n {
         sink = asmcrypto::ecdsa::recover_address(&hash, &r, &s, v).unwrap_or([0u8; 20]);
     }
-    let us = t0.elapsed().as_nanos() as f64 / n as f64 / 1_000.0;
-    println!("asmcrypto recover_address: {us:.2} µs/call  ({n} iters)");
+    let us_orig = t0.elapsed().as_nanos() as f64 / n as f64 / 1_000.0;
+    println!(
+        "ecdsa  (4×64 Solinas)  recover_address: {us_orig:.2} µs/call  ({n} iters)  addr={}",
+        hex(&sink)
+    );
+
+    // ── ecdsa_clone (5×52-bit, libsecp256k1 translation) ─────────────────────
+    for _ in 0..200 {
+        let _ = asmcrypto::ecdsa_clone::recover_address(&hash, &sig65);
+    }
+    let t1 = std::time::Instant::now();
+    for _ in 0..n {
+        sink = asmcrypto::ecdsa_clone::recover_address(&hash, &sig65).unwrap_or([0u8; 20]);
+    }
+    let us_clone = t1.elapsed().as_nanos() as f64 / n as f64 / 1_000.0;
+    println!(
+        "ecdsa_clone (5×52 clone) recover_address: {us_clone:.2} µs/call  ({n} iters)  addr={}",
+        hex(&sink)
+    );
+
+    println!("ratio clone/orig: {:.3}", us_clone / us_orig);
+
     // Prevent dead-code elimination
     if sink[0] == 0xff {
         eprintln!("(should not print)");
     }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
