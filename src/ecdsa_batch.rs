@@ -40,10 +40,10 @@ const P2: u64 = 0xFFFFFFFFFFFFFFFF;
 const P3: u64 = 0xFFFFFFFFFFFFFFFF;
 
 // 2p limbs — used in reduction: temporarily hold values up to 2p before a conditional subtract.
-const P2_0: u64 = 0xFFFFFFFDFFFFF85E;
-const P2_1: u64 = 0xFFFFFFFFFFFFFFFF;
-const P2_2: u64 = 0xFFFFFFFFFFFFFFFF;
-const P2_3: u64 = 0xFFFFFFFFFFFFFFFF;
+// const P2_0: u64 = 0xFFFFFFFDFFFFF85E;
+// const P2_1: u64 = 0xFFFFFFFFFFFFFFFF;
+// const P2_2: u64 = 0xFFFFFFFFFFFFFFFF;
+// const P2_3: u64 = 0xFFFFFFFFFFFFFFFF;
 
 const N0: u64 = 0xBFD25E8CD0364141;
 const N1: u64 = 0xBAAEDCE6AF48A03B;

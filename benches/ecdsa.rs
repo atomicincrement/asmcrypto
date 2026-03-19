@@ -1,6 +1,7 @@
 use asmcrypto::ecdsa::{
     recover_address as our_recover_address, recover_public_key as our_recover_pubkey,
 };
+use asmcrypto::ecdsa_batch::recover_addresses_batch;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -176,5 +177,70 @@ fn bench_ecdsa(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_ecdsa);
+// ─────────────────────────────────────────────────────────────────────────────
+// Batch benchmark: recover_addresses_batch (8 lanes) vs 8× scalar calls
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn bench_ecdsa_batch(c: &mut Criterion) {
+    let tv = make_test_vector();
+
+    // Replicate the single vector across 8 lanes for a fair batch comparison.
+    let hashes = [&tv.hash; 8];
+    let rs = [&tv.r; 8];
+    let ss = [&tv.s; 8];
+    let vs = [tv.v; 8];
+
+    let mut g = c.benchmark_group("ecdsa/recover_address_x8");
+
+    // ── asmcrypto batch (our 8-lane AVX-512 path) ─────────────────────────────
+    g.bench_function("asmcrypto-batch", |b| {
+        b.iter(|| {
+            recover_addresses_batch(
+                black_box(hashes),
+                black_box(rs),
+                black_box(ss),
+                black_box(vs),
+            )
+        })
+    });
+
+    // ── 8× asmcrypto scalar (our own baseline, no SIMD) ──────────────────────
+    g.bench_function("asmcrypto-scalar-x8", |b| {
+        b.iter(|| {
+            std::array::from_fn::<[u8; 20], 8, _>(|i| {
+                our_recover_address(
+                    black_box(hashes[i]),
+                    black_box(rs[i]),
+                    black_box(ss[i]),
+                    black_box(vs[i]),
+                )
+                .unwrap_or([0u8; 20])
+            })
+        })
+    });
+
+    // ── 8× secp256k1 C library + sha3 keccak ─────────────────────────────────
+    g.bench_function("secp256k1-x8", |b| {
+        b.iter(|| {
+            std::array::from_fn::<[u8; 20], 8, _>(|i| {
+                use sha3::Digest as _;
+                let pk = bench_secp256k1::recover_pubkey(
+                    black_box(hashes[i]),
+                    black_box(rs[i]),
+                    black_box(ss[i]),
+                    black_box(vs[i]),
+                );
+                // Ethereum address = keccak256(uncompressed_pubkey[1..])[12..]
+                let h: [u8; 32] = sha3::Keccak256::digest(&pk[1..]).into();
+                let mut addr = [0u8; 20];
+                addr.copy_from_slice(&h[12..]);
+                addr
+            })
+        })
+    });
+
+    g.finish();
+}
+
+criterion_group!(benches, bench_ecdsa, bench_ecdsa_batch);
 criterion_main!(benches);
