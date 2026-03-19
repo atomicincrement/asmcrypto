@@ -1,4 +1,5 @@
 use asmcrypto::keccak::keccak256 as our_keccak256;
+use asmcrypto::keccak_batch::keccak256_batch;
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use sha3::Digest as _;
 use tiny_keccak::Hasher as _;
@@ -55,5 +56,57 @@ fn bench_keccak(c: &mut Criterion) {
     bench_keccak_size(c, "1MiB", &input1m);
 }
 
-criterion_group!(benches, bench_keccak);
+/// Benchmark 8-stream batch hashing for a given fixed input length.
+///
+/// Compares:
+///   - `keccak256_batch`: our AVX-512 implementation processing 8 streams in parallel.
+///   - `tiny-keccak ×8`:  8 sequential `tiny_keccak::Keccak::v256()` calls (industry baseline).
+///   - `asmcrypto ×8`:    8 sequential scalar calls from our own `keccak256`.
+fn bench_batch_size(c: &mut Criterion, label: &str, len: usize) {
+    // Build 8 distinct input buffers to avoid the branch predictor / prefetcher
+    // trivially collapsing them into one.
+    let bufs: Vec<Vec<u8>> = (0..8usize).map(|i| vec![(i as u8).wrapping_add(1); len]).collect();
+
+    let mut g = c.benchmark_group(format!("keccak256_batch/{label}"));
+    g.throughput(Throughput::Elements(8)); // 8 hashes per iteration
+
+    // Our AVX-512 path.
+    g.bench_function("asmcrypto-batch", |b| {
+        b.iter(|| {
+            let inputs: [&[u8]; 8] = std::array::from_fn(|i| bufs[i].as_slice());
+            keccak256_batch(black_box(inputs))
+        })
+    });
+
+    // tiny-keccak sequential loop (the typical baseline in Ethereum tooling).
+    g.bench_function("tiny-keccak ×8", |b| {
+        b.iter(|| {
+            std::array::from_fn::<[u8; 32], 8, _>(|i| {
+                let mut out = [0u8; 32];
+                let mut h = tiny_keccak::Keccak::v256();
+                h.update(black_box(bufs[i].as_slice()));
+                h.finalize(&mut out);
+                out
+            })
+        })
+    });
+
+    // Our own scalar loop for a fair apples-to-apples baseline.
+    g.bench_function("asmcrypto ×8", |b| {
+        b.iter(|| {
+            std::array::from_fn::<[u8; 32], 8, _>(|i| our_keccak256(black_box(bufs[i].as_slice())))
+        })
+    });
+
+    g.finish();
+}
+
+fn bench_keccak_batch(c: &mut Criterion) {
+    bench_batch_size(c, "32B", 32);
+    bench_batch_size(c, "64B (pubkey)", 64);
+    bench_batch_size(c, "136B (1 block)", 136);
+    bench_batch_size(c, "272B (2 blocks)", 272);
+}
+
+criterion_group!(benches, bench_keccak, bench_keccak_batch);
 criterion_main!(benches);
