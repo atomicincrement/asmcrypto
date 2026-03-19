@@ -12,18 +12,16 @@
 //!    (x^(m-2) mod m) kept for comparison.
 //!  - `fe_inv_var` and `scalar_inv_var` are the Safegcd-based (`modinv64`)
 //!    implementations that match what the C library actually uses.
-//!  - `ecmult` implements Strauss wNAF (w=5) with GLV endomorphism, matching
-//!    the C algorithm.  The precomputed G / 2¹²⁸·G tables are cached in a
-//!    `OnceLock` so the 128-doubling setup cost is paid only on the first call.
-//!    The C library uses a much larger static window (WINDOW_G≈15); here we use
-//!    the same WINDOW_A=5 for G, trading table size for simplicity.
+//!  - `ecmult` uses WINDOW_A=5 for variable-base A and WINDOW_G=15 for the
+//!    fixed-base G tables, matching the C library.  The G / 2¹²⁸·G tables
+//!    (TABLE_SIZE_G = 8192 entries each) are stored as compile-time statics in
+//!    `g_tables_generated.rs` (regenerate with `gen_g_tables`).
 //!  - VERIFY_CHECK / VERIFY_BITS / magnitude tracking are omitted (they are
 //!    debug-only assertions in the C library).
 
 #![allow(dead_code, clippy::many_single_char_names)]
 
 use crate::modinv64::{FE_MODINFO, SCALAR_MODINFO, modinv64_var};
-use std::sync::OnceLock;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § 1  Field element  (5 × 52-bit limbs, C: secp256k1_fe)
@@ -1586,8 +1584,16 @@ pub fn gej_add_ge(a: &Gej, b: &Ge) -> Gej {
 
 /// Window size for Strauss wNAF — matches C's WINDOW_A.
 const WINDOW_A: usize = 5;
-/// Number of table entries per scalar: 2^(w-2) = 8 → {1,3,…,15}·P.
+/// Number of table entries per A scalar: 2^(w-2) = 8 → {1,3,…,15}·P.
 const TABLE_SIZE: usize = 1 << (WINDOW_A - 2);
+/// Window size for the fixed-base G tables — matches C's WINDOW_G.
+const WINDOW_G: usize = 15;
+/// Number of table entries for G: 2^(WINDOW_G-2) = 8192.
+pub const TABLE_SIZE_G: usize = 1 << (WINDOW_G - 2);
+
+// Static G table data (PRE_G_DATA, PRE_G128_DATA, g_table_get_ge).
+// Regenerate with: cargo run --example gen_g_tables --release > src/g_tables_generated.rs
+include!("g_tables_generated.rs");
 
 // ── GLV constants ─────────────────────────────────────────────────────────────
 // C: $BASE/scalar_impl.h
@@ -1800,10 +1806,64 @@ fn build_odd_multiples_table(a: &Gej) -> [Ge; TABLE_SIZE] {
     pre
 }
 
+/// Vec-based table builder — same logic as `build_odd_multiples_table` but
+/// for an arbitrary number of entries.  Used to precompute the large G tables.
+fn build_odd_multiples_table_vec(a: &Gej, n: usize) -> Vec<Ge> {
+    let two_a = gej_double(a);
+    let mut jac = vec![*a; n];
+    for i in 1..n {
+        jac[i] = gej_add_var(&jac[i - 1], &two_a);
+    }
+    let mut products = vec![Fe { n: [1, 0, 0, 0, 0] }; n];
+    products[0] = jac[0].z;
+    for i in 1..n {
+        products[i] = fe_mul(&products[i - 1], &jac[i].z);
+    }
+    let mut run_inv = fe_inv_var(&products[n - 1]);
+    run_inv.normalize();
+    let inf_ge = Ge {
+        x: Fe { n: [0; 5] },
+        y: Fe { n: [0; 5] },
+        infinity: true,
+    };
+    let mut pre = vec![inf_ge; n];
+    for i in (0..n).rev() {
+        let zi = if i > 0 {
+            let zi = fe_mul(&run_inv, &products[i - 1]);
+            run_inv = fe_mul(&run_inv, &jac[i].z);
+            zi
+        } else {
+            run_inv
+        };
+        let zi2 = fe_mul(&zi, &zi);
+        let zi3 = fe_mul(&zi2, &zi);
+        let mut x = fe_mul(&jac[i].x, &zi2);
+        let mut y = fe_mul(&jac[i].y, &zi3);
+        x.normalize_weak();
+        y.normalize_weak();
+        pre[i] = Ge {
+            x,
+            y,
+            infinity: false,
+        };
+    }
+    pre
+}
+
+/// Build the pre_g and pre_g128 affine tables for `WINDOW_G`.
+/// Called by the `gen_g_tables` example to emit static table data.
+pub fn build_g_tables_vec() -> (Vec<Ge>, Vec<Ge>) {
+    let g_jac = Gej::set_ge(&G);
+    let pre_g = build_odd_multiples_table_vec(&g_jac, TABLE_SIZE_G);
+    let g128_jac = (0..128u32).fold(g_jac, |acc, _| gej_double(&acc));
+    let pre_g128 = build_odd_multiples_table_vec(&g128_jac, TABLE_SIZE_G);
+    (pre_g, pre_g128)
+}
+
 /// Table lookup: return the entry for odd index `n` (negate y if n < 0).
 /// — C: $BASE/ecmult_impl.h  `ecmult_table_get_ge`
 #[inline(always)]
-fn table_get_ge(pre: &[Ge; TABLE_SIZE], n: i32) -> Ge {
+fn table_get_ge(pre: &[Ge], n: i32) -> Ge {
     debug_assert!(n != 0 && (n & 1) != 0);
     if n > 0 {
         pre[((n - 1) / 2) as usize]
@@ -1820,7 +1880,7 @@ fn table_get_ge(pre: &[Ge; TABLE_SIZE], n: i32) -> Ge {
 /// λ-twisted table lookup: x from `aux` (= β·x of pre), y from `pre`.
 /// — C: $BASE/ecmult_impl.h  `ecmult_table_get_ge_lambda`
 #[inline(always)]
-fn table_get_ge_lambda(pre: &[Ge; TABLE_SIZE], aux: &[Fe; TABLE_SIZE], n: i32) -> Ge {
+fn table_get_ge_lambda(pre: &[Ge], aux: &[Fe], n: i32) -> Ge {
     debug_assert!(n != 0 && (n & 1) != 0);
     if n > 0 {
         let idx = ((n - 1) / 2) as usize;
@@ -1840,21 +1900,6 @@ fn table_get_ge_lambda(pre: &[Ge; TABLE_SIZE], aux: &[Fe; TABLE_SIZE], n: i32) -
 }
 
 // ── Main Strauss wNAF ecmult ──────────────────────────────────────────────────
-
-/// One-time initialisation: compute pre_g and pre_g128 tables, cached globally.
-/// In the C library these are huge static arrays computed at compile time.
-/// Here we build them once on first call and store in a global OnceLock.
-/// C: $BASE/ecmult_impl.h — `ecmult_odd_multiples_table` over G / 2¹²⁸·G
-fn g_tables() -> &'static ([Ge; TABLE_SIZE], [Ge; TABLE_SIZE]) {
-    static CACHE: OnceLock<([Ge; TABLE_SIZE], [Ge; TABLE_SIZE])> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        let g_jac = Gej::set_ge(&G);
-        let pre_g = build_odd_multiples_table(&g_jac);
-        let g128_jac = (0..128u32).fold(g_jac, |acc, _| gej_double(&acc));
-        let pre_g128 = build_odd_multiples_table(&g128_jac);
-        (pre_g, pre_g128)
-    })
-}
 
 /// Compute `u1·G + u2·a` using Strauss wNAF with GLV endomorphism.
 ///
@@ -1882,16 +1927,11 @@ pub fn ecmult(a: &Gej, u2: &Scalar, u1: &Scalar) -> Gej {
         aux[i].normalize_weak();
     }
 
-    // ── Fetch cached affine tables for G and 2¹²⁸·G ─────────────────────────
-    // The G tables are constant (G is the secp256k1 generator) and expensive to
-    // build (128 doublings + 1 batch-inversion each), so cache them globally.
-    let (pre_g, pre_g128) = g_tables();
-
     // ── wNAF for all four ~128-bit scalars ──────────────────────────────────
     let (wnaf_na1, bits_na1) = ecmult_wnaf(&na_1, WINDOW_A);
     let (wnaf_nalm, bits_nalm) = ecmult_wnaf(&na_lam, WINDOW_A);
-    let (wnaf_ng1, bits_ng1) = ecmult_wnaf(&ng_1, WINDOW_A);
-    let (wnaf_ng128, bits_ng128) = ecmult_wnaf(&ng_128, WINDOW_A);
+    let (wnaf_ng1, bits_ng1) = ecmult_wnaf(&ng_1, WINDOW_G);
+    let (wnaf_ng128, bits_ng128) = ecmult_wnaf(&ng_128, WINDOW_G);
 
     let bits = bits_na1.max(bits_nalm).max(bits_ng1).max(bits_ng128);
 
@@ -1915,13 +1955,13 @@ pub fn ecmult(a: &Gej, u2: &Scalar, u1: &Scalar) -> Gej {
         if i < bits_ng1 {
             let n = wnaf_ng1[i];
             if n != 0 {
-                r = gej_add_ge_var(&r, &table_get_ge(&pre_g, n));
+                r = gej_add_ge_var(&r, &g_table_get_ge(&PRE_G_DATA, n));
             }
         }
         if i < bits_ng128 {
             let n = wnaf_ng128[i];
             if n != 0 {
-                r = gej_add_ge_var(&r, &table_get_ge(&pre_g128, n));
+                r = gej_add_ge_var(&r, &g_table_get_ge(&PRE_G128_DATA, n));
             }
         }
     }

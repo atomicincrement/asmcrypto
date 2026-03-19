@@ -617,3 +617,34 @@ Differences vs. C: Rust `i128`/`u128` replace the `secp256k1_int128` helper; `u6
 | `ecdsa_clone` safegcd inversion | **29.06 µs** | 33% faster, 44% faster than Solinas |
 
 **Build:** 13/13 tests pass, commit `eadb8ef`.
+
+---
+
+## 2026-03-19 — Static G tables with WINDOW_G = 15
+
+### Prompt
+> Can we use static data to store the tables?
+
+### High-level effects
+
+- Added `WINDOW_G = 15` and `pub const TABLE_SIZE_G = 8192` constants alongside the existing `WINDOW_A = 5 / TABLE_SIZE = 8`.
+- `table_get_ge` and `table_get_ge_lambda` signatures widened from `&[Ge; TABLE_SIZE]` to `&[Ge]` (slices) to support variable-size tables.
+- Added `build_odd_multiples_table_vec(a, n)` (Vec-based, any size) and `pub fn build_g_tables_vec()` (computes the two WINDOW_G-sized tables for G and 2¹²⁸·G).
+- New example `gen_g_tables` runs the computation once and emits `src/g_tables_generated.rs` — a 16 400-line Rust source file containing:
+  - `static PRE_G_DATA: [[u64; 10]; 8192]` — odd multiples of G in 5×52 limb form
+  - `static PRE_G128_DATA: [[u64; 10]; 8192]` — odd multiples of 2¹²⁸·G
+  - `fn g_table_get_ge(data, n)` — inline lookup / optional y-negation
+- `include!("g_tables_generated.rs")` replaces the runtime `OnceLock<(Vec<Ge>, Vec<Ge>)>`; the G-table data is now a zero-cost compile-time constant.
+- `ecmult_wnaf` calls for the G scalars (`ng_1`, `ng_128`) updated from `WINDOW_A` to `WINDOW_G`; A scalars unchanged.
+
+**Performance (50 000 iterations, `--release`):**
+
+| Implementation | Time | vs C |
+|---|---|---|
+| `ecdsa_clone` safegcd + WINDOW_A=5 (OnceLock) | 29.06 µs | 1.36× |
+| `ecdsa_clone` safegcd + WINDOW_G=15 (static)  | **25.49 µs** | **1.19×** |
+| secp256k1 C library | 21.36 µs | 1.00× |
+
+Addition cost for G scalars drops from ~32 additions/scalar (window 5) to ~9 additions/scalar (window 15), a 78% reduction.
+
+**Build:** 13/13 `ecdsa_clone` tests pass.
