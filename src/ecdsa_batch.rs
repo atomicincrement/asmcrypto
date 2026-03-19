@@ -1127,12 +1127,19 @@ pub mod x8 {
         let mut t: [__m512i; 5] =
             core::array::from_fn(|k| _mm512_add_epi64(a.limbs[k], b.limbs[k]));
 
-        // carry propagation
-        for k in 0..4 {
-            let carry = _mm512_srli_epi64(t[k], 52);
-            t[k] = _mm512_and_epi64(t[k], mask52);
-            t[k + 1] = _mm512_add_epi64(t[k + 1], carry);
-        }
+        // carry propagation (unrolled)
+        let carry = _mm512_srli_epi64(t[0], 52);
+        t[0] = _mm512_and_epi64(t[0], mask52);
+        t[1] = _mm512_add_epi64(t[1], carry);
+        let carry = _mm512_srli_epi64(t[1], 52);
+        t[1] = _mm512_and_epi64(t[1], mask52);
+        t[2] = _mm512_add_epi64(t[2], carry);
+        let carry = _mm512_srli_epi64(t[2], 52);
+        t[2] = _mm512_and_epi64(t[2], mask52);
+        t[3] = _mm512_add_epi64(t[3], carry);
+        let carry = _mm512_srli_epi64(t[3], 52);
+        t[3] = _mm512_and_epi64(t[3], mask52);
+        t[4] = _mm512_add_epi64(t[4], carry);
 
         // conditional subtract p: compute d = t - p with borrow chain
         let (d, no_borrow) = sub_p_x8(t, &p, mask52);
@@ -1411,17 +1418,24 @@ pub mod x8 {
         let zero = _mm512_setzero_si512();
 
         let mut d = [zero; 5];
-        let mut borrow = zero; // 0 or 1 per lane
 
-        for k in 0..5 {
-            // d[k] = a[k] + 2^52 - b[k] - borrow_in
-            let mut v = _mm512_add_epi64(a[k], base);
-            v = _mm512_sub_epi64(v, b[k]);
-            v = _mm512_sub_epi64(v, borrow);
-            // borrow_out = 1 if the slot didn't have enough, i.e. v < 2^52
-            borrow = _mm512_sub_epi64(one, _mm512_srli_epi64(v, 52));
-            d[k] = _mm512_and_epi64(v, mask52);
+        // borrow chain (unrolled k=0..4)
+        macro_rules! borrow_step {
+            ($k:literal, $borrow:expr) => {{
+                let v = _mm512_sub_epi64(
+                    _mm512_sub_epi64(_mm512_add_epi64(a[$k], base), b[$k]),
+                    $borrow,
+                );
+                d[$k] = _mm512_and_epi64(v, mask52);
+                _mm512_sub_epi64(one, _mm512_srli_epi64(v, 52))
+            }};
         }
+        let borrow = borrow_step!(0, zero);
+        let borrow = borrow_step!(1, borrow);
+        let borrow = borrow_step!(2, borrow);
+        let borrow = borrow_step!(3, borrow);
+        let borrow = borrow_step!(4, borrow);
+
         // no_borrow_mask: bit i set iff borrow[lane i] == 0 (t >= p)
         let no_borrow_mask = _mm512_cmpeq_epi64_mask(borrow, zero);
         (d, no_borrow_mask)
