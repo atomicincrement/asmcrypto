@@ -3277,9 +3277,14 @@ impl U256 {
 //
 // `recover_addresses_avx512` is fully vectorised over AVX-512 ZMM registers:
 //
-//   Phase 1a (scalar per-lane): validate r,s; lift r→curve point; compute r⁻¹,
-//            u1 = −z·r⁻¹ (mod n), u2 = s·r⁻¹ (mod n).
-//            Invalid lanes are given dummy values so later vector ops stay safe.
+//   Phase 1a (vectorised): validate r,s (scalar bitmask); then for all 8 lanes
+//            simultaneously:
+//              rhs = r³+7 (mod p)          via fp_sq_x8 + fp_mul_x8 + fp_add_x8
+//              r_y = sqrt(rhs)             via fp_sqrt_x8  (a^((p+1)/4))
+//              r_inv = r⁻¹ (mod n)        via fn_inv_x8   (a^(n−2))
+//              u1 = −z·r⁻¹ (mod n)       via fn_mul_x8 + fn_neg_x8
+//              u2 = s·r⁻¹  (mod n)       via fn_mul_x8
+//            Invalid lanes receive dummy (G) values so later vector ops are safe.
 //
 //   Phase 1b (vectorised): u1·G for all 8 lanes via scalar_mul_g_x8;
 //            u2·R for all 8 lanes via scalar_mul_affine_x8;
@@ -3297,10 +3302,92 @@ unsafe fn recover_addresses_avx512(
     ss: [&[u8; 32]; 8],
     vs: [u8; 8],
 ) -> [[u8; 20]; 8] {
-    use x8::{load, pt_add_x8, scalar_mul_affine_x8, scalar_mul_g_x8, store, to_affine_x8};
+    use x8::{
+        blend_x8, fn_inv_x8, fn_mul_x8, fn_neg_x8, fp_add_x8, fp_mul_x8, fp_neg_x8, fp_sq_x8,
+        fp_sqrt_x8, load, pt_add_x8, scalar_mul_affine_x8, scalar_mul_g_x8, store, to_affine_x8,
+    };
 
-    // ── Phase 1a: per-lane scalar setup ──────────────────────────────────────
-    // Dummy affine point (G) used for invalid lanes so all vector ops are safe.
+    // ── Phase 1a: vectorised setup ────────────────────────────────────────────
+
+    // Parse all 8 inputs as raw U256 integers.
+    let r_vals: [U256; 8] = core::array::from_fn(|i| U256::from_be_bytes(rs[i]));
+    let s_vals: [U256; 8] = core::array::from_fn(|i| U256::from_be_bytes(ss[i]));
+    let z_vals: [U256; 8] = core::array::from_fn(|i| U256::from_be_bytes(hashes[i]));
+
+    // Scalar bitmask: validate r, s ∈ [1, n−1].  The range check is inherently
+    // branchy; doing it lane-by-lane before the vector path is negligible cost.
+    let mut valid = [true; 8];
+    for lane in 0..8 {
+        if r_vals[lane].is_zero()
+            || r_vals[lane].ge(&SCALAR_N)
+            || s_vals[lane].is_zero()
+            || s_vals[lane].ge(&SCALAR_N)
+        {
+            valid[lane] = false;
+        }
+    }
+
+    // Pack r, s, z into U256x8 (52-bit limb form) for vectorised arithmetic.
+    // Invalid-lane values load fine; their results are discarded at the end.
+    let rs_raw: [[u64; 4]; 8] = core::array::from_fn(|i| r_vals[i].0);
+    let ss_raw: [[u64; 4]; 8] = core::array::from_fn(|i| s_vals[i].0);
+    let zs_raw: [[u64; 4]; 8] = core::array::from_fn(|i| z_vals[i].0);
+
+    let r_x8 = unsafe { load(&rs_raw) };
+    let s_x8 = unsafe { load(&ss_raw) };
+    let z_x8 = unsafe { load(&zs_raw) };
+
+    // rhs = r³ + 7 (mod p) — all 8 lanes simultaneously.
+    let r_cu_x8 = unsafe { fp_mul_x8(fp_sq_x8(r_x8), r_x8) };
+    let seven_x8 = unsafe { load(&[[7u64, 0, 0, 0]; 8]) };
+    let rhs_x8 = unsafe { fp_add_x8(r_cu_x8, seven_x8) };
+
+    // r_y = rhs^((p+1)/4) mod p — vectorised square root, all 8 lanes.
+    let r_y_raw_x8 = unsafe { fp_sqrt_x8(rhs_x8) };
+
+    // Verify: fp_sq(r_y) must equal rhs; lanes where it doesn't are invalid
+    // (r_x is not on the curve, i.e. rhs is not a quadratic residue mod p).
+    {
+        let check_x8 = unsafe { fp_sq_x8(r_y_raw_x8) };
+        let check_raw = unsafe { store(check_x8) };
+        let rhs_raw = unsafe { store(rhs_x8) };
+        for lane in 0..8 {
+            if valid[lane] && check_raw[lane] != rhs_raw[lane] {
+                valid[lane] = false;
+            }
+        }
+    }
+
+    // Parity selection: negate r_y in the lanes where its low bit differs from v.
+    let r_y_neg_x8 = unsafe { fp_neg_x8(r_y_raw_x8) };
+    let parity_mask: u8 = {
+        let r_y_stored = unsafe { store(r_y_raw_x8) };
+        let mut mask: u8 = 0;
+        for lane in 0..8 {
+            let y_parity = (r_y_stored[lane][0] & 1) as u8;
+            if y_parity != (vs[lane] & 1) {
+                mask |= 1u8 << lane;
+            }
+        }
+        mask
+    };
+    // blend: if parity_mask bit i = 1 → use negated y; else use raw y.
+    let r_y_x8 = unsafe { blend_x8(parity_mask, r_y_neg_x8, r_y_raw_x8) };
+
+    // r_inv = r^(n−2) mod n — Fermat's little theorem, all 8 lanes simultaneously.
+    // This replaces 8 sequential 254-squaring chains with one parallel call.
+    let r_inv_x8 = unsafe { fn_inv_x8(r_x8) };
+
+    // u1 = −z·r_inv mod n,  u2 = s·r_inv mod n — all 8 lanes.
+    let u1_x8 = unsafe { fn_neg_x8(fn_mul_x8(z_x8, r_inv_x8)) };
+    let u2_x8 = unsafe { fn_mul_x8(s_x8, r_inv_x8) };
+
+    // Store results back to scalar arrays and apply dummy values for invalid lanes.
+    let u1_raw = unsafe { store(u1_x8) };
+    let u2_raw = unsafe { store(u2_x8) };
+    let ry_raw = unsafe { store(r_y_x8) };
+
+    // Dummy affine point (G) so that invalid-lane vector ops produce a safe non-∞ result.
     let dummy_x = U256([
         0x59F2815B16F81798,
         0x029BFCDB2DCE28D9,
@@ -3313,54 +3400,19 @@ unsafe fn recover_addresses_avx512(
         0x5DA4FBFC0E1108A8,
         0x483ADA7726A3C465,
     ]);
-    let one_n = U256([1, 0, 0, 0]);
 
-    let mut valid = [true; 8];
-    let mut u1s = [one_n; 8]; // default 1  → 1·G
-    let mut u2s = [U256([2, 0, 0, 0]); 8]; // default 2  → 2·G; 1·G+2·G=3·G ≠ ∞
-    let mut rx_arr = [dummy_x; 8];
-    let mut ry_arr = [dummy_y; 8];
+    let mut u1s: [U256; 8] = core::array::from_fn(|i| U256(u1_raw[i]));
+    let mut u2s: [U256; 8] = core::array::from_fn(|i| U256(u2_raw[i]));
+    let mut rx_arr: [U256; 8] = r_vals;
+    let mut ry_arr: [U256; 8] = core::array::from_fn(|i| U256(ry_raw[i]));
 
     for lane in 0..8 {
-        let r_u = U256::from_be_bytes(rs[lane]);
-        let s_u = U256::from_be_bytes(ss[lane]);
-        let z = U256::from_be_bytes(hashes[lane]);
-
-        if r_u.is_zero() || r_u.ge(&SCALAR_N) {
-            valid[lane] = false;
-            continue;
+        if !valid[lane] {
+            u1s[lane] = U256([1, 0, 0, 0]); // 1·G + 2·G = 3·G ≠ ∞
+            u2s[lane] = U256([2, 0, 0, 0]);
+            rx_arr[lane] = dummy_x;
+            ry_arr[lane] = dummy_y;
         }
-        if s_u.is_zero() || s_u.ge(&SCALAR_N) {
-            valid[lane] = false;
-            continue;
-        }
-
-        // Lift r_x to secp256k1 curve point.
-        let r_x3 = scalar_fp_mul(&scalar_fp_sq(&r_u), &r_u);
-        let rhs = scalar_fp_add(&r_x3, &U256([7, 0, 0, 0]));
-        let mut r_y = match scalar_fp_sqrt(&rhs) {
-            Some(y) => y,
-            None => {
-                valid[lane] = false;
-                continue;
-            }
-        };
-        if (r_y.0[0] & 1) != (vs[lane] & 1) as u64 {
-            r_y = scalar_fp_neg(&r_y);
-        }
-
-        let r_inv = match scalar_fn_inv(&r_u) {
-            Some(i) => i,
-            None => {
-                valid[lane] = false;
-                continue;
-            }
-        };
-
-        u1s[lane] = scalar_fn_neg(&scalar_fn_mul(&z, &r_inv));
-        u2s[lane] = scalar_fn_mul(&s_u, &r_inv);
-        rx_arr[lane] = r_u;
-        ry_arr[lane] = r_y;
     }
 
     // ── Phase 1b: vectorised scalar multiplications ───────────────────────────
