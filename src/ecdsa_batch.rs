@@ -1277,11 +1277,34 @@ pub mod x8 {
 
         // ── Step 2: carry propagation to normalise to 52-bit limbs ───────────
         let mask52 = _mm512_set1_epi64(MASK52 as i64);
-        for k in 0..9 {
-            let carry = _mm512_srli_epi64(t[k], 52);
-            t[k] = _mm512_and_epi64(t[k], mask52);
-            t[k + 1] = _mm512_add_epi64(t[k + 1], carry);
-        }
+        // Unrolled k = 0..8
+        let cy = _mm512_srli_epi64(t[0], 52);
+        t[0] = _mm512_and_epi64(t[0], mask52);
+        t[1] = _mm512_add_epi64(t[1], cy);
+        let cy = _mm512_srli_epi64(t[1], 52);
+        t[1] = _mm512_and_epi64(t[1], mask52);
+        t[2] = _mm512_add_epi64(t[2], cy);
+        let cy = _mm512_srli_epi64(t[2], 52);
+        t[2] = _mm512_and_epi64(t[2], mask52);
+        t[3] = _mm512_add_epi64(t[3], cy);
+        let cy = _mm512_srli_epi64(t[3], 52);
+        t[3] = _mm512_and_epi64(t[3], mask52);
+        t[4] = _mm512_add_epi64(t[4], cy);
+        let cy = _mm512_srli_epi64(t[4], 52);
+        t[4] = _mm512_and_epi64(t[4], mask52);
+        t[5] = _mm512_add_epi64(t[5], cy);
+        let cy = _mm512_srli_epi64(t[5], 52);
+        t[5] = _mm512_and_epi64(t[5], mask52);
+        t[6] = _mm512_add_epi64(t[6], cy);
+        let cy = _mm512_srli_epi64(t[6], 52);
+        t[6] = _mm512_and_epi64(t[6], mask52);
+        t[7] = _mm512_add_epi64(t[7], cy);
+        let cy = _mm512_srli_epi64(t[7], 52);
+        t[7] = _mm512_and_epi64(t[7], mask52);
+        t[8] = _mm512_add_epi64(t[8], cy);
+        let cy = _mm512_srli_epi64(t[8], 52);
+        t[8] = _mm512_and_epi64(t[8], mask52);
+        t[9] = _mm512_add_epi64(t[9], cy);
         // After propagation: t[0..8] < 2^52; t[9] < 2^4 (at most 1 partial product).
 
         // ── Step 3: Solinas fold ──────────────────────────────────────────────
@@ -1319,11 +1342,19 @@ pub mod x8 {
 
         // ── Step 4: second carry propagation ─────────────────────────────────
         // The fold may have inflated t[0..4] beyond 2^52; propagate carries again.
-        for k in 0..4 {
-            let carry = _mm512_srli_epi64(t[k], 52);
-            t[k] = _mm512_and_epi64(t[k], mask52);
-            t[k + 1] = _mm512_add_epi64(t[k + 1], carry);
-        }
+        // Unrolled k = 0..3
+        let cy = _mm512_srli_epi64(t[0], 52);
+        t[0] = _mm512_and_epi64(t[0], mask52);
+        t[1] = _mm512_add_epi64(t[1], cy);
+        let cy = _mm512_srli_epi64(t[1], 52);
+        t[1] = _mm512_and_epi64(t[1], mask52);
+        t[2] = _mm512_add_epi64(t[2], cy);
+        let cy = _mm512_srli_epi64(t[2], 52);
+        t[2] = _mm512_and_epi64(t[2], mask52);
+        t[3] = _mm512_add_epi64(t[3], cy);
+        let cy = _mm512_srli_epi64(t[3], 52);
+        t[3] = _mm512_and_epi64(t[3], mask52);
+        t[4] = _mm512_add_epi64(t[4], cy);
         // Tiny chance t[4] still overflowed its 48-bit budget; handle via a
         // second Solinas pass on the carry out of limb 4.
         // carry4 < 2^6 (at most a few extra bits), K < 2^33, product < 2^39 < 2^52
