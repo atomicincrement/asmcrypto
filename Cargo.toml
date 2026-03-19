@@ -2,6 +2,13 @@
 name = "asmcrypto"
 version = "0.1.0"
 edition = "2024"
+description = "Register-parallel cryptographic primitives: 8-lane AVX-512 Keccak-256 batch and secp256k1 ECDSA batch address recovery, outperforming libsecp256k1."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/andy-thomason/asmcrypto"
+documentation = "https://docs.rs/asmcrypto"
+readme = "README.md"
+keywords = ["keccak", "ecdsa", "secp256k1", "avx512", "ethereum"]
+categories = ["cryptography", "algorithms"]
 
 [dependencies]
 [dev-dependencies]
@@ -28,3 +35,9 @@ harness = false
 [[bench]]
 name = "mul_wide"
 harness = false
+
+[[example]]
+name = "keccak_batch"
+
+[[example]]
+name = "ecdsa_batch"
