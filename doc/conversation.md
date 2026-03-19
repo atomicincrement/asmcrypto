@@ -732,3 +732,22 @@ New module `src/keccak_batch.rs` with `pub fn keccak256_batch(inputs: [&[u8]; 8]
 | `ecdsa_clone.rs:1049` | `mut` not needed on `m0`–`m5` | Removed `mut`; variables are write-once (via `extract!` macro) |
 | `ecdsa_clone.rs:1077` | `mut` not needed on `p0`–`p3` | Removed `mut` |
 | `ecdsa_clone.rs:1427` | `mut` not needed on `rz` | Changed `let mut rz` → `let rz` |
+
+---
+
+## Prompt: "benchmark keccak256_batch against tiny_keccak"
+
+**Commit:** `dbf0cc1` — *bench: add keccak256_batch vs tiny-keccak criterion group*
+
+**Effect:** Extended `benches/keccak.rs` with a new `keccak256_batch` Criterion group that runs three competitors over four input sizes: `asmcrypto-batch` (our AVX-512), `tiny-keccak ×8` (8 sequential calls, industry baseline), and `asmcrypto ×8` (8 sequential scalar calls).
+
+### Results (criterion, release, AVX-512F + AVX-512BW)
+
+| Input size | asmcrypto-batch | tiny-keccak ×8 | asmcrypto ×8 | vs tiny-keccak | vs own scalar |
+|---|---|---|---|---|---|
+| 32 B | 257 ns | 3 208 ns | 1 504 ns | **12.5×** | 5.9× |
+| 64 B (pubkey) | 258 ns | 3 216 ns | 1 498 ns | **12.5×** | 5.8× |
+| 136 B (1 block) | 466 ns | 6 327 ns | 2 876 ns | **13.6×** | 6.2× |
+| 272 B (2 blocks) | 672 ns | 9 225 ns | 4 312 ns | **13.7×** | 6.4× |
+
+The batch speedup vs tiny-keccak grows with input length (more permutation calls per hash → more AVX-512 parallelism amortised per iteration). At 64 B (the primary Ethereum pubkey → address use case) the batch path processes 8 hashes in 258 ns — equivalent to 32 ns/hash vs 402 ns/hash for tiny-keccak.
