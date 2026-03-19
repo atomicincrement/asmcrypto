@@ -1021,8 +1021,8 @@ fn scalar_mul_affine(scalar: &U256, px: &U256, py: &U256) -> JacPt {
 pub mod x8 {
     #![allow(unsafe_op_in_unsafe_fn)]
     use super::{
-        P0, P1, P2, P3, U256, scalar_fp_add, scalar_fp_mul, scalar_fp_neg, scalar_fp_sq,
-        scalar_fp_sqrt,
+        P0, P1, P2, P3, U256, scalar_fn_inv, scalar_fn_mul, scalar_fp_add, scalar_fp_mul,
+        scalar_fp_neg, scalar_fp_sq, scalar_fp_sqrt,
     };
     use core::arch::x86_64::*;
 
@@ -1506,6 +1506,469 @@ pub mod x8 {
         (d, no_borrow_mask)
     }
 
+    // ── Scalar-field (mod n) multiplication ──────────────────────────────────
+
+    /// secp256k1 group order n in 5 × 52-bit limbs (little-endian).
+    ///
+    /// n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    const FN52_N: [u64; 5] = [
+        0x25e8cd0364141,
+        0xe6af48a03bbfd,
+        0xffffffebaaedc,
+        0xfffffffffffff,
+        0xffffffffffff,
+    ];
+
+    /// 2^260 mod n  =  (2^256 − n) × 16, stored in 3 × 52-bit limbs (limbs 3,4 are zero).
+    ///
+    /// N_C = 2^256 − n = 0x14551231950B75FC4402DA1732FC9BEBF
+    /// NC16 = N_C × 16  (133 bits)  →  limbs [NC16_0, NC16_1, NC16_2, 0, 0]
+    const NC16_0: u64 = 0xa1732fc9bebf0; // bits  0.. 51 of NC16
+    const NC16_1: u64 = 0x950b75fc4402d; // bits 52..103 of NC16
+    const NC16_2: u64 = 0x14551231; // bits 104..131 of NC16 (26 bits)
+
+    /// N_C = 2^256 − n in 3 × 52-bit limbs, used for the final top-bit fold.
+    /// Bits 256..259 of the 260-bit accumulator are folded by: q × 2^256 ≡ q × N_C (mod n).
+    const NC_0: u64 = 0xda1732fc9bebf; // bits  0.. 51 of N_C
+    const NC_1: u64 = 0x1950b75fc4402; // bits 52..103 of N_C
+    const NC_2: u64 = 0x1455123; // bits 104..128 of N_C (25 bits)
+
+    /// Compute `a * b mod n` for all 8 lanes using VPMADD52 (AVX-512IFMA).
+    ///
+    /// The secp256k1 group order n = 2^256 − N_C where N_C = 2^256 − n fits in
+    /// 129 bits.  We use NC16 = N_C × 16 ≡ 2^260 (mod n) so that the 260-bit
+    /// product can be reduced with three-limb Solinas folds.
+    ///
+    /// Algorithm:
+    /// 1. Schoolbook 5×5 using madd52lo/hi → 10 product limb accumulators.
+    /// 2. Carry propagation → normalise t[0..9].
+    /// 3. First Solinas fold: t[5..9] × NC16[0..2] → adds into t[0..7].
+    ///    The t[9]×NC16_2 high part writes to t[7] (must not be omitted).
+    /// 4. Carry propagation t[0..7] → normalise including t[7].
+    /// 5. Second fold: t[5..7] × NC16[0..2] → adds into t[0..5].
+    /// 6. Carry propagation t[0..4].
+    /// 7. Top-bit fold: extract q = t[4]>>48 (bits 256..259 of the result),
+    ///    clear those bits from t[4], add q × N_C into t[0..3], re-carry t[0..4].
+    /// 8. Conditional subtract n.
+    ///
+    /// # Safety
+    /// Requires `avx512f`, `avx512ifma`.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub unsafe fn fn_mul_x8(a: U256x8, b: U256x8) -> U256x8 {
+        let [a0, a1, a2, a3, a4] = a.limbs;
+        let [b0, b1, b2, b3, b4] = b.limbs;
+        let z = _mm512_setzero_si512();
+        let mask52 = _mm512_set1_epi64(MASK52 as i64);
+
+        macro_rules! mlo {
+            ($acc:expr, $x:expr, $y:expr) => {
+                _mm512_madd52lo_epu64($acc, $x, $y)
+            };
+        }
+        macro_rules! mhi {
+            ($acc:expr, $x:expr, $y:expr) => {
+                _mm512_madd52hi_epu64($acc, $x, $y)
+            };
+        }
+
+        // ── Step 1: schoolbook 5×5 (50 VPMADD52) ─────────────────────────────
+        let mut t = [z; 10];
+
+        // i = 0
+        t[0] = mlo!(t[0], a0, b0);
+        t[1] = mhi!(t[1], a0, b0);
+        t[1] = mlo!(t[1], a0, b1);
+        t[2] = mhi!(t[2], a0, b1);
+        t[2] = mlo!(t[2], a0, b2);
+        t[3] = mhi!(t[3], a0, b2);
+        t[3] = mlo!(t[3], a0, b3);
+        t[4] = mhi!(t[4], a0, b3);
+        t[4] = mlo!(t[4], a0, b4);
+        t[5] = mhi!(t[5], a0, b4);
+
+        // i = 1
+        t[1] = mlo!(t[1], a1, b0);
+        t[2] = mhi!(t[2], a1, b0);
+        t[2] = mlo!(t[2], a1, b1);
+        t[3] = mhi!(t[3], a1, b1);
+        t[3] = mlo!(t[3], a1, b2);
+        t[4] = mhi!(t[4], a1, b2);
+        t[4] = mlo!(t[4], a1, b3);
+        t[5] = mhi!(t[5], a1, b3);
+        t[5] = mlo!(t[5], a1, b4);
+        t[6] = mhi!(t[6], a1, b4);
+
+        // i = 2
+        t[2] = mlo!(t[2], a2, b0);
+        t[3] = mhi!(t[3], a2, b0);
+        t[3] = mlo!(t[3], a2, b1);
+        t[4] = mhi!(t[4], a2, b1);
+        t[4] = mlo!(t[4], a2, b2);
+        t[5] = mhi!(t[5], a2, b2);
+        t[5] = mlo!(t[5], a2, b3);
+        t[6] = mhi!(t[6], a2, b3);
+        t[6] = mlo!(t[6], a2, b4);
+        t[7] = mhi!(t[7], a2, b4);
+
+        // i = 3
+        t[3] = mlo!(t[3], a3, b0);
+        t[4] = mhi!(t[4], a3, b0);
+        t[4] = mlo!(t[4], a3, b1);
+        t[5] = mhi!(t[5], a3, b1);
+        t[5] = mlo!(t[5], a3, b2);
+        t[6] = mhi!(t[6], a3, b2);
+        t[6] = mlo!(t[6], a3, b3);
+        t[7] = mhi!(t[7], a3, b3);
+        t[7] = mlo!(t[7], a3, b4);
+        t[8] = mhi!(t[8], a3, b4);
+
+        // i = 4
+        t[4] = mlo!(t[4], a4, b0);
+        t[5] = mhi!(t[5], a4, b0);
+        t[5] = mlo!(t[5], a4, b1);
+        t[6] = mhi!(t[6], a4, b1);
+        t[6] = mlo!(t[6], a4, b2);
+        t[7] = mhi!(t[7], a4, b2);
+        t[7] = mlo!(t[7], a4, b3);
+        t[8] = mhi!(t[8], a4, b3);
+        t[8] = mlo!(t[8], a4, b4);
+        t[9] = mhi!(t[9], a4, b4);
+
+        // ── Step 2: carry propagation t[0..9] ────────────────────────────────
+        macro_rules! prop {
+            ($lo:literal, $hi:literal) => {{
+                let cy = _mm512_srli_epi64(t[$lo], 52);
+                t[$lo] = _mm512_and_epi64(t[$lo], mask52);
+                t[$hi] = _mm512_add_epi64(t[$hi], cy);
+            }};
+        }
+        prop!(0, 1);
+        prop!(1, 2);
+        prop!(2, 3);
+        prop!(3, 4);
+        prop!(4, 5);
+        prop!(5, 6);
+        prop!(6, 7);
+        prop!(7, 8);
+        prop!(8, 9);
+
+        // ── Step 3: first Solinas fold (36 VPMADD52) ─────────────────────────
+        //
+        // 2^260 ≡ NC16 (mod n); NC16 = [NC16_0, NC16_1, NC16_2] in 52-bit limbs.
+        // For each high limb t[5+j] (j=0..4), fold into t[j..j+3] via NC16[0..2].
+        //
+        // ALIASING guard: save t[5..9] as h5..h9 and zero t[5..7] FIRST, so that
+        // mhi overflow writes into fresh accumulators without reading stale values.
+        let nc0 = _mm512_set1_epi64(NC16_0 as i64);
+        let nc1 = _mm512_set1_epi64(NC16_1 as i64);
+        let nc2 = _mm512_set1_epi64(NC16_2 as i64);
+
+        let (h5, h6, h7, h8, h9) = (t[5], t[6], t[7], t[8], t[9]);
+        t[5] = z;
+        t[6] = z;
+        t[7] = z;
+
+        // h5 × NC16 → t[0..3]
+        t[0] = mlo!(t[0], h5, nc0);
+        t[1] = mhi!(t[1], h5, nc0);
+        t[1] = mlo!(t[1], h5, nc1);
+        t[2] = mhi!(t[2], h5, nc1);
+        t[2] = mlo!(t[2], h5, nc2);
+        t[3] = mhi!(t[3], h5, nc2);
+
+        // h6 × NC16 → t[1..4]
+        t[1] = mlo!(t[1], h6, nc0);
+        t[2] = mhi!(t[2], h6, nc0);
+        t[2] = mlo!(t[2], h6, nc1);
+        t[3] = mhi!(t[3], h6, nc1);
+        t[3] = mlo!(t[3], h6, nc2);
+        t[4] = mhi!(t[4], h6, nc2);
+
+        // h7 × NC16 → t[2..5]  (t[5] was zeroed above, accumulates mhi)
+        t[2] = mlo!(t[2], h7, nc0);
+        t[3] = mhi!(t[3], h7, nc0);
+        t[3] = mlo!(t[3], h7, nc1);
+        t[4] = mhi!(t[4], h7, nc1);
+        t[4] = mlo!(t[4], h7, nc2);
+        t[5] = mhi!(t[5], h7, nc2);
+
+        // h8 × NC16 → t[3..6]
+        t[3] = mlo!(t[3], h8, nc0);
+        t[4] = mhi!(t[4], h8, nc0);
+        t[4] = mlo!(t[4], h8, nc1);
+        t[5] = mhi!(t[5], h8, nc1);
+        t[5] = mlo!(t[5], h8, nc2);
+        t[6] = mhi!(t[6], h8, nc2);
+
+        // h9 × NC16 → t[4..7]
+        t[4] = mlo!(t[4], h9, nc0);
+        t[5] = mhi!(t[5], h9, nc0);
+        t[5] = mlo!(t[5], h9, nc1);
+        t[6] = mhi!(t[6], h9, nc1);
+        t[6] = mlo!(t[6], h9, nc2);
+        t[7] = mhi!(t[7], h9, nc2);
+
+        // ── Step 4: carry propagation t[0..7] ────────────────────────────────
+        prop!(0, 1);
+        prop!(1, 2);
+        prop!(2, 3);
+        prop!(3, 4);
+        prop!(4, 5);
+        prop!(5, 6);
+        prop!(6, 7);
+
+        // ── Step 5: second fold — t[5], t[6], t[7] × NC16 ───────────────────
+        // After carry prop: t[5] < 2^52, t[6] < 2^52, t[7] < 2^21.
+        // Save and zero t[5..7] to avoid aliasing again.
+        let (g5, g6, g7) = (t[5], t[6], t[7]);
+        t[5] = z;
+        t[6] = z;
+        t[7] = z;
+
+        // g5 × NC16 → t[0..3]
+        t[0] = mlo!(t[0], g5, nc0);
+        t[1] = mhi!(t[1], g5, nc0);
+        t[1] = mlo!(t[1], g5, nc1);
+        t[2] = mhi!(t[2], g5, nc1);
+        t[2] = mlo!(t[2], g5, nc2);
+        t[3] = mhi!(t[3], g5, nc2);
+
+        // g6 × NC16 → t[1..4]
+        t[1] = mlo!(t[1], g6, nc0);
+        t[2] = mhi!(t[2], g6, nc0);
+        t[2] = mlo!(t[2], g6, nc1);
+        t[3] = mhi!(t[3], g6, nc1);
+        t[3] = mlo!(t[3], g6, nc2);
+        t[4] = mhi!(t[4], g6, nc2);
+
+        // g7 × NC16 → t[2..5]
+        // g7 < 2^21, NC16_2 < 2^26 → g7*NC16_2 < 2^47 → mhi = 0; top write omitted.
+        t[2] = mlo!(t[2], g7, nc0);
+        t[3] = mhi!(t[3], g7, nc0);
+        t[3] = mlo!(t[3], g7, nc1);
+        t[4] = mhi!(t[4], g7, nc1);
+        t[4] = mlo!(t[4], g7, nc2);
+
+        // ── Step 6: carry propagation t[0..4] ────────────────────────────────
+        prop!(0, 1);
+        prop!(1, 2);
+        prop!(2, 3);
+        prop!(3, 4);
+
+        // ── Step 7: top-bit fold ──────────────────────────────────────────────
+        //
+        // After fold1+fold2, t[0..4] represent a value in [0, 2^260).
+        // t[4] is at bit-position 208, so bits 256..259 of the result live
+        // at bits 48..51 of t[4].  Extract q = t[4] >> 48 (at most 4 bits),
+        // clear those bits, then add q × N_C (since 2^256 ≡ N_C (mod n)).
+        //
+        // NC_0/1/2 are the 52-bit limbs of N_C = 2^256 − n.
+        let nc0b = _mm512_set1_epi64(NC_0 as i64);
+        let nc1b = _mm512_set1_epi64(NC_1 as i64);
+        let nc2b = _mm512_set1_epi64(NC_2 as i64);
+        let mask48 = _mm512_set1_epi64(((1u64 << 48) - 1) as i64);
+
+        let q = _mm512_srli_epi64(t[4], 48);
+        t[4] = _mm512_and_epi64(t[4], mask48);
+
+        // q × N_C → t[0..3]
+        t[0] = mlo!(t[0], q, nc0b);
+        t[1] = mhi!(t[1], q, nc0b);
+        t[1] = mlo!(t[1], q, nc1b);
+        t[2] = mhi!(t[2], q, nc1b);
+        t[2] = mlo!(t[2], q, nc2b);
+        t[3] = mhi!(t[3], q, nc2b);
+
+        // Re-propagate t[0..4]
+        prop!(0, 1);
+        prop!(1, 2);
+        prop!(2, 3);
+        prop!(3, 4);
+
+        // ── Step 8: conditional subtract n ───────────────────────────────────
+        let n: [__m512i; 5] = core::array::from_fn(|k| _mm512_set1_epi64(FN52_N[k] as i64));
+        let t5 = [t[0], t[1], t[2], t[3], t[4]];
+        let (d, no_borrow) = sub_p_x8(t5, &n, mask52);
+        let result: [__m512i; 5] =
+            core::array::from_fn(|k| _mm512_mask_blend_epi64(no_borrow, t5[k], d[k]));
+        U256x8 { limbs: result }
+    }
+
+    /// Compute `a^2 mod n` for all 8 lanes.
+    ///
+    /// # Safety
+    /// Requires `avx512f`, `avx512ifma`.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub unsafe fn fn_sq_x8(a: U256x8, n: u32) -> U256x8 {
+        let mut r = fn_mul_x8(a, a);
+        for _ in 1..n {
+            r = fn_mul_x8(r, r);
+        }
+        r
+    }
+
+    /// Compute `a^(n−2) mod n` for all 8 lanes, i.e. the modular inverse of `a`.
+    ///
+    /// Uses a Fermat-inversion addition chain for n−2 derived from the run-length
+    /// structure of the secp256k1 group-order bit pattern:
+    ///
+    /// ```text
+    /// n−2 = 1{127} 0 [0xBAAEDCE6AF48A03BBFD25E8CD036413F]
+    /// ```
+    ///
+    /// Block-building phase (same doubling strategy as `fp_sqrt_x8` up to x88) plus
+    /// auxiliary blocks x4, x8, x17, x39, x127 cover all run lengths in the lower 128 bits.
+    ///
+    /// Total cost: 412 squarings + 46 multiplications.
+    ///
+    /// # Safety
+    /// Requires `avx512f`, `avx512ifma`.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub unsafe fn fn_inv_x8(a: U256x8) -> U256x8 {
+        macro_rules! sq {
+            ($x:expr, $n:expr) => {
+                fn_sq_x8($x, $n)
+            };
+        }
+        macro_rules! mul {
+            ($x:expr, $y:expr) => {
+                fn_mul_x8($x, $y)
+            };
+        }
+
+        // ── Block-building phase ──────────────────────────────────────────────
+        let x1 = a;
+        let x2 = mul!(sq!(x1, 1), x1); //  1 sq, 1 mul  → a^(2^2−1)
+        let x3 = mul!(sq!(x2, 1), x1); //  1 sq, 1 mul  → a^(2^3−1)
+        let x6 = mul!(sq!(x3, 3), x3); //  3 sq, 1 mul  → a^(2^6−1)
+        let x9 = mul!(sq!(x6, 3), x3); //  3 sq, 1 mul  → a^(2^9−1)
+        let x11 = mul!(sq!(x9, 2), x2); //  2 sq, 1 mul  → a^(2^11−1)
+        let x22 = mul!(sq!(x11, 11), x11); // 11 sq, 1 mul  → a^(2^22−1)
+        let x44 = mul!(sq!(x22, 22), x22); // 22 sq, 1 mul  → a^(2^44−1)
+        let x88 = mul!(sq!(x44, 44), x44); // 44 sq, 1 mul  → a^(2^88−1)
+
+        // Additional blocks not in fp_sqrt:
+        let x4 = mul!(sq!(x3, 1), x1); //  1 sq, 1 mul  → a^(2^4−1)
+        let x8 = mul!(sq!(x4, 4), x4); //  4 sq, 1 mul  → a^(2^8−1)
+        let x17 = mul!(sq!(x11, 6), x6); //  6 sq, 1 mul  → a^(2^17−1)
+        let x39 = mul!(sq!(x22, 17), x17); // 17 sq, 1 mul  → a^(2^39−1)
+        let x127 = mul!(sq!(x88, 39), x39); // 39 sq, 1 mul  → a^(2^127−1)
+
+        // ── Assembly phase: n−2 = 1{127} 0 [low 128 bits] ────────────────────
+        //
+        // x127 = a^(2^127−1) represents the 127 high ones (bits 255..129).
+        // We continue from here processing the remaining 129 bits (bit 128..0):
+        //   - bit 128 = 0: one squaring, no multiply
+        //   - bits 127..0 = 0xBAAEDCE6AF48A03BBFD25E8CD036413F: run-length encoded
+        //
+        // Each run of k ones: k squarings then 1 multiply by x_k.
+        // Each run of k zeros: k squarings, no multiply.
+        let r = x127;
+        let r = sq!(r, 1); // bit 128 = 0
+
+        // Low 128 bits of n−2 = 0xBAAEDCE6AF48A03BBFD25E8CD036413F processed as
+        // runs; each run of k ones consumes k squarings then 1 multiplication.
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 1);
+        let r = sq!(r, 3);
+        let r = mul!(r, x3); // run 3
+        let r = sq!(r, 1);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 1);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 1);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 1);
+        let r = sq!(r, 3);
+        let r = mul!(r, x3); // run 3
+        let r = sq!(r, 1);
+        let r = sq!(r, 2);
+        let r = mul!(r, x2); // run 2
+        let r = sq!(r, 1);
+        let r = sq!(r, 3);
+        let r = mul!(r, x3); // run 3
+        let r = sq!(r, 2);
+        let r = sq!(r, 3);
+        let r = mul!(r, x3); // run 3
+        let r = sq!(r, 2);
+        let r = sq!(r, 2);
+        let r = mul!(r, x2); // run 2
+        let r = sq!(r, 1);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 1);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 1);
+        let r = sq!(r, 4);
+        let r = mul!(r, x4); // run 4
+        let r = sq!(r, 1);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 2);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 3);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 1);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 7);
+        let r = sq!(r, 3);
+        let r = mul!(r, x3); // run 3
+        let r = sq!(r, 1);
+        let r = sq!(r, 3);
+        let r = mul!(r, x3); // run 3
+        let r = sq!(r, 1);
+        let r = sq!(r, 8);
+        let r = mul!(r, x8); // run 8
+        let r = sq!(r, 1);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 2);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 2);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 1);
+        let r = sq!(r, 4);
+        let r = mul!(r, x4); // run 4
+        let r = sq!(r, 1);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 3);
+        let r = sq!(r, 2);
+        let r = mul!(r, x2); // run 2
+        let r = sq!(r, 2);
+        let r = sq!(r, 2);
+        let r = mul!(r, x2); // run 2
+        let r = sq!(r, 1);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 6);
+        let r = sq!(r, 2);
+        let r = mul!(r, x2); // run 2
+        let r = sq!(r, 1);
+        let r = sq!(r, 2);
+        let r = mul!(r, x2); // run 2
+        let r = sq!(r, 2);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 5);
+        let r = sq!(r, 1);
+        let r = mul!(r, x1); // run 1
+        let r = sq!(r, 2);
+        let r = sq!(r, 6);
+        let r = mul!(r, x6); // run 6
+        r
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────────
     #[cfg(test)]
     mod tests_x8 {
@@ -1671,6 +2134,121 @@ pub mod x8 {
             let got = unsafe { store(c8) };
             for lane in 0..8 {
                 assert_eq!(got[lane], a_val, "a * 1 != a at lane {lane}");
+            }
+        }
+
+        /// fn_mul_x8 matches scalar_fn_mul on several test vectors.
+        #[test]
+        fn test_fn_mul_x8_matches_scalar() {
+            if !check_avx512() {
+                return;
+            }
+            // secp256k1 generator compressed x-coordinate mod n (arbitrary non-trivial value)
+            let a_val = [
+                0x59F2815B16F81798u64,
+                0x029BFCDB2DCE28D9,
+                0x55A06295CE870B07,
+                0x79BE667EF9DCBBAC,
+            ];
+            let b_val = [
+                0xBFD25E8CD036413Fu64,
+                0xBAAEDCE6AF48A03B,
+                0xFFFFFFFFFFFFFFFE,
+                0xFFFFFFFFFFFFFFFF,
+            ]; // n − 1 (a non-trivial scalar)
+            let expected = scalar_fn_mul(&U256(a_val), &U256(b_val));
+            let a8 = unsafe { load(&[a_val; 8]) };
+            let b8 = unsafe { load(&[b_val; 8]) };
+            let c8 = unsafe { fn_mul_x8(a8, b8) };
+            let got = unsafe { store(c8) };
+            for lane in 0..8 {
+                assert_eq!(
+                    U256(got[lane]),
+                    expected,
+                    "fn_mul_x8 lane {lane}: got {:?} expected {:?}",
+                    got[lane],
+                    expected.0
+                );
+            }
+        }
+
+        /// fn_mul_x8: a * 1 == a (mod n).
+        #[test]
+        fn test_fn_mul_by_one_x8() {
+            if !check_avx512() {
+                return;
+            }
+            let a_val = [
+                0x59F2815B16F81798u64,
+                0x029BFCDB2DCE28D9,
+                0x55A06295CE870B07,
+                0x79BE667EF9DCBBAC,
+            ];
+            let one_val = [1u64, 0, 0, 0];
+            let a8 = unsafe { load(&[a_val; 8]) };
+            let one8 = unsafe { load(&[one_val; 8]) };
+            let c8 = unsafe { fn_mul_x8(a8, one8) };
+            let got = unsafe { store(c8) };
+            for lane in 0..8 {
+                assert_eq!(got[lane], a_val, "fn_mul_x8: a * 1 != a at lane {lane}");
+            }
+        }
+
+        /// fn_inv_x8 matches scalar_fn_inv.
+        #[test]
+        fn test_fn_inv_x8_matches_scalar() {
+            if !check_avx512() {
+                return;
+            }
+            let test_vals: [[u64; 4]; 4] = [
+                // generator x-coordinate (arbitrary non-trivial)
+                [
+                    0x59F2815B16F81798,
+                    0x029BFCDB2DCE28D9,
+                    0x55A06295CE870B07,
+                    0x79BE667EF9DCBBAC,
+                ],
+                // small value
+                [7, 0, 0, 0],
+                // n − 3 (near-modulus)
+                [
+                    0xBFD25E8CD036413D,
+                    0xBAAEDCE6AF48A03B,
+                    0xFFFFFFFFFFFFFFFE,
+                    0xFFFFFFFFFFFFFFFF,
+                ],
+                // random-ish
+                [
+                    0xDEADBEEFCAFEBABE,
+                    0x1234567890ABCDEF,
+                    0xFEDCBA0987654321,
+                    0x0102030405060708,
+                ],
+            ];
+            for a_val in test_vals {
+                let expected = scalar_fn_inv(&U256(a_val)).expect("scalar_fn_inv failed");
+                let a8 = unsafe { load(&[a_val; 8]) };
+                let inv8 = unsafe { fn_inv_x8(a8) };
+                let got = unsafe { store(inv8) };
+                for lane in 0..8 {
+                    assert_eq!(
+                        U256(got[lane]),
+                        expected,
+                        "fn_inv_x8 lane {lane}: got {:?} expected {:?}",
+                        got[lane],
+                        expected.0
+                    );
+                }
+                // Verify a * inv(a) == 1 (mod n)
+                let prod8 = unsafe { fn_mul_x8(a8, inv8) };
+                let prod = unsafe { store(prod8) };
+                for lane in 0..8 {
+                    assert_eq!(
+                        prod[lane],
+                        [1, 0, 0, 0],
+                        "fn_inv_x8: a * inv(a) != 1 at lane {lane}"
+                    );
+                }
             }
         }
     }

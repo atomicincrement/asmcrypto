@@ -847,3 +847,74 @@ Exported functions (all `pub unsafe fn`, require `avx512f,avx512ifma`):
 The 2× speedup over sequential scalar is from the SIMD instruction-level parallelism.
 Full throughput benefit requires the wNAF scalar-mul loop to also be vectorised.
 
+---
+
+## Session: vectorised fn_mul_x8 / fn_inv_x8 — scalar-field mod n (commit TBD)
+
+**Prompt:** Move to the next item — implement fn_mul_x8 and fn_inv_x8.
+
+### fn_mul_x8 — Solinas reduction for n (secp256k1 group order)
+
+Added `fn_mul_x8`, `fn_sq_x8`, and `fn_inv_x8` to `src/ecdsa_batch.rs` `x8` module.
+
+**Challenge:** n's top limb is only 48 bits (`2^48−1` = `0xffffffffffff`),
+so the 5-limb 52-bit representation can hold values up to 16·n after schoolbook
+multiply. A single conditional subtract is insufficient; Solinas folds must tightly
+control the residue size.
+
+**Algorithm for fn_mul_x8 (schoolbook 5×5 ≡ mod n):**
+
+Constants: `NC16 = (2^256 − n) × 16` stored in 3 52-bit limbs (`NC16_0/1/2`),
+exploiting `2^260 ≡ NC16 (mod n)`. `NC_0/1/2` are 52-bit limbs of `N_C = 2^256 − n`
+used in the final "top-bit fold" step.
+
+1. **Schoolbook:** 25 × (mlo + mhi) = 50 VPMADD52 → t[0..10].
+2. **Carry propagation** t[0..9].
+3. **Fold 1 (aliasing-safe):** Save t[5..9] as `h5..h9`, zero t[5..7],
+   then fold each `hj × NC16` into t[j..j+3]. Accumulates mhi overflows into
+   fresh t[5..7] without aliasing old schoolbook values.
+   - **Key bug found:** original code read t[5..9] in-place while writing t[5] from
+     `t[7]×NC16_2.mhi`, creating an aliasing read-after-write error that made the
+     result completely wrong (not merely off by a multiple of n).
+4. **Carry propagation** t[0..7].
+5. **Fold 2:** Save t[5..7] as `g5..g7` (fresh overflow from fold 1), zero t[5..7],
+   fold each `gj × NC16` into t[j..j+3]. g7 < 2^21 after fold 1 + carry, so
+   `mhi(g7, NC16_2) = 0`; its top write is omitted.
+6. **Carry propagation** t[0..4].
+7. **Top-bit fold:** Extract `q = t[4] >> 48`, mask t[4] to 48 bits,
+   fold `q × N_C` into t[0..3], re-propagate t[0..4].
+   (Top nibble of t[4] holds bits 256–259 of the full product; fold via N_C since
+   `2^256 ≡ N_C (mod n)`.)
+8. **Conditional subtract n.**
+
+**Total:** 50 (schoolbook) + 36 (fold 1) + 18 (fold 2) + 6 (top fold) = 110 VPMADD52.
+
+### fn_inv_x8 — Fermat inversion via addition chain for n−2
+
+`fn_inv_x8(a)` computes `a^(n−2) mod n` using a custom addition chain.
+
+**Block-building phase (identical to fp_sqrt_x8 up through x88):**
+- `x2, x3, x6, x9, x11, x22, x44, x88` — same doubling-ladder as before.
+
+**Additional blocks for n−2's lower 128 bits:**
+- `x4, x8, x17, x39, x127` — cover run lengths in `0xBAAEDCE6AF48A03BBFD25E8CD036413F`.
+
+**Assembly phase (corrected):**
+- n−2 = `1{127} 0 [0xBAAEDCE6AF48A03BBFD25E8CD036413F]` (256 bits).
+- Start from `r = x127` (representing bits 255..129 already consumed).
+- `sq!(r, 1)` — advance past bit 128 = 0.
+- Process bits 127..0 using run-length encoded pairs `sq!(r, k); mul!(r, xk)`.
+
+**Bug found in assembly:** Original code had `sq!(x127, 129)` to "place ones at
+bits 255..129", which added 129 extraneous squarings (making the exponent 2^129×
+too large = 385 bits instead of 256 bits). Python exponent trace confirmed the
+fix: remove the `sq!(x127, 129)` and start directly from `r = x127`.
+
+**Total cost:** 411 squarings + 46 multiplications.
+
+**Tests added:**
+- `test_fn_mul_x8_matches_scalar` — 8 random fn_mul_x8 lanes vs scalar fn_mul.
+- `test_fn_mul_by_one_x8` — a × 1 = a for all 8 lanes.
+- `test_fn_inv_x8_matches_scalar` — 8 random fn_inv_x8 lanes vs scalar fn_inv.
+
+All 39 tests pass (39 passed, 0 failed).
