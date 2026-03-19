@@ -1124,3 +1124,38 @@ Observed results on this hardware:
 The vectorised batch path achieves ~2× throughput over 8 sequential scalar
 calls, consistent with the expected gain from parallelising the Montgomery
 field arithmetic over 8 ZMM lanes.
+
+---
+
+## Prompt: "Update phase 1a to vector if possible."
+
+**Commit:** `e54a4e6  perf: vectorise Phase 1a of recover_addresses_avx512 (fp_sqrt_x8, fn_inv_x8, fn_mul_x8)`
+
+Phase 1a of `recover_addresses_avx512` previously ran sequentially over the 8
+lanes using scalar maths (`scalar_fp_sqrt`, `scalar_fn_inv`, `scalar_fn_mul`,
+`scalar_fn_neg`).  All 8 operations exist in vectorised AVX-512 form in the
+`x8` module; the Phase 1a loop was replaced with a single vectorised pass:
+
+| Step | Before | After |
+|---|---|---|
+| rhs = r³+7 (mod p) | 8× `scalar_fp_mul` + `scalar_fp_sq` | 1× `fp_sq_x8` + `fp_mul_x8` + `fp_add_x8` |
+| r_y = √rhs (mod p) | 8× `scalar_fp_sqrt` (a^((p+1)/4), 253 squarings each) | 1× `fp_sqrt_x8` over all 8 lanes |
+| sqrt validity check | 8× `scalar_fp_sq` + compare | 1× `fp_sq_x8` + store + compare |
+| parity selection | 8× conditional `scalar_fp_neg` | `fp_neg_x8` + 8-bit `parity_mask` + `blend_x8` |
+| r_inv (mod n) | 8× `scalar_fn_inv` (Fermat, ≈254 sq + 12 mul each) | 1× `fn_inv_x8` over all 8 lanes |
+| u1, u2 (mod n) | 8× `scalar_fn_mul` + `scalar_fn_neg` | 1× `fn_mul_x8` + `fn_neg_x8` + `fn_mul_x8` |
+
+The range validation for r, s ∈ [1, n−1] remains scalar (8 comparisons) since
+it is branchy by nature and contributes negligible time.
+
+Results on this hardware (N=5000 batches of 8, release build):
+
+| Variant | Before | After |
+|---|---|---|
+| asmcrypto batch x8 (same sig) | 221 047 ns / 36 krecov/s | **124 509 ns / 64 krecov/s** |
+| asmcrypto batch x8 (varied hashes) | 244 864 ns / 33 krecov/s | **160 989 ns / 50 krecov/s** |
+| secp256k1 C lib x8 | 174 434 ns / 46 krecov/s | (unchanged baseline) |
+
+The vectorised batch path now beats the highly-tuned libsecp256k1 C library by
+**~1.4× per lane** on the same-signature workload and is slightly faster on the
+varied-hash workload.  45/45 tests still pass.
