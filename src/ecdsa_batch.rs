@@ -994,6 +994,537 @@ fn scalar_mul_affine(scalar: &U256, px: &U256, py: &U256) -> JacPt {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// AVX-512 vectorised secp256k1 Fp arithmetic — U256x8
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Represents 8 field elements in parallel using **5 × 52-bit limbs**.
+// Each `__m512i` in `U256x8::limbs[k]` holds limb `k` for all 8 values:
+//
+//  lane:   [ 7  | 6  | 5  | 4  | 3  | 2  | 1  | 0  ]   ← one __m512i
+//  bits:   [ 52k .. 52(k+1) )  for each of the 8 field elements
+//
+// 5 × 52 = 260 bits allocated; the top limb (k=4) uses only 48 bits.
+//
+// Using 52-bit limbs enables the AVX-512IFMA instructions VPMADD52LO/HI
+// (`_mm512_madd52lo/hi_epu64`) to compute exact widening multiplies:
+//   madd52lo(z, a, b)  ←  z += (a * b)[51:0]
+//   madd52hi(z, a, b)  ←  z += (a * b)[103:52]
+//
+// The schoolbook 5×5 product therefore needs 50 VPMADD52 instructions
+// (2 per (i,j) pair) and no u128 arithmetic.
+//
+// Solinas reduction uses the fact that 2^256 ≡ K (mod p) where K = 2^32+977.
+// The fold multiplier 16K (= 2^36+15632 ≈ 2^36.5) fits in 37 bits, so the
+// fold itself is also expressible as a single VPMADD52 per excess limb.
+
+#[cfg(target_arch = "x86_64")]
+pub mod x8 {
+    #![allow(unsafe_op_in_unsafe_fn)]
+    use super::{P0, P1, P2, P3, U256, scalar_fp_mul};
+    use core::arch::x86_64::*;
+
+    // ── Constants ─────────────────────────────────────────────────────────────
+
+    pub const MASK52: u64 = (1u64 << 52) - 1;
+
+    /// secp256k1 prime p in 5 × 52-bit limb form (little-endian).
+    pub const FP52_P: [u64; 5] = to_52bit([P0, P1, P2, P3]);
+
+    /// Convert a 4-limb 64-bit LE U256 to 5-limb 52-bit form.
+    pub const fn to_52bit(v: [u64; 4]) -> [u64; 5] {
+        let (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+        [
+            v0 & MASK52,                        // bits   0.. 51
+            ((v0 >> 52) | (v1 << 12)) & MASK52, // bits  52..103
+            ((v1 >> 40) | (v2 << 24)) & MASK52, // bits 104..155
+            ((v2 >> 28) | (v3 << 36)) & MASK52, // bits 156..207
+            v3 >> 16,                           // bits 208..255 (48 bits)
+        ]
+    }
+
+    /// Convert 5-limb 52-bit form back to 4-limb 64-bit LE U256.
+    pub const fn from_52bit(l: [u64; 5]) -> [u64; 4] {
+        [
+            l[0] | (l[1] << 52),
+            (l[1] >> 12) | (l[2] << 40),
+            (l[2] >> 24) | (l[3] << 28),
+            (l[3] >> 36) | (l[4] << 16),
+        ]
+    }
+
+    // ── Data type ────────────────────────────────────────────────────────────
+
+    /// Eight secp256k1 Fp elements in parallel, 5 × 52-bit limb representation.
+    ///
+    /// `limbs[k]` is a `__m512i` whose 8 u64 lanes each hold bit-field
+    /// `[52k .. 52(k+1))` of one field element.
+    ///
+    /// **Loose invariant**: after any exported function the result satisfies
+    /// `limbs[k] < 2^52` for k < 4, `limbs[4] < 2^48`, giving a canonical
+    /// representative in `[0, p)`.
+    #[derive(Clone, Copy)]
+    pub struct U256x8 {
+        pub limbs: [__m512i; 5],
+    }
+
+    // ── Constructors / destructors ────────────────────────────────────────────
+
+    /// Load 8 field elements from an array of 4-limb 64-bit LE U256 values.
+    ///
+    /// # Safety
+    /// Caller must have ensured `avx512f` and `avx512ifma` are available.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub unsafe fn load(vals: &[[u64; 4]; 8]) -> U256x8 {
+        let mut raw = [[0u64; 5]; 8];
+        for i in 0..8 {
+            raw[i] = to_52bit(vals[i]);
+        }
+        let mut limbs = [_mm512_setzero_si512(); 5];
+        for k in 0..5 {
+            limbs[k] = _mm512_set_epi64(
+                raw[7][k] as i64,
+                raw[6][k] as i64,
+                raw[5][k] as i64,
+                raw[4][k] as i64,
+                raw[3][k] as i64,
+                raw[2][k] as i64,
+                raw[1][k] as i64,
+                raw[0][k] as i64,
+            );
+        }
+        U256x8 { limbs }
+    }
+
+    /// Store 8 field elements back to an array of 4-limb 64-bit LE U256 values.
+    ///
+    /// # Safety
+    /// Same as `load`.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub unsafe fn store(a: U256x8) -> [[u64; 4]; 8] {
+        let mut raw = [[0u64; 5]; 8];
+        for k in 0..5 {
+            let lane: [u64; 8] = core::mem::transmute(a.limbs[k]);
+            for i in 0..8 {
+                raw[i][k] = lane[i];
+            }
+        }
+        core::array::from_fn(|i| from_52bit(raw[i]))
+    }
+
+    // ── Field addition / subtraction / negation ───────────────────────────────
+
+    /// Compute `a + b mod p` for all 8 lanes.
+    ///
+    /// # Safety
+    /// Requires `avx512f`.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub unsafe fn fp_add_x8(a: U256x8, b: U256x8) -> U256x8 {
+        let mask52 = _mm512_set1_epi64(MASK52 as i64);
+        // p in ZMM splats
+        let p = core::array::from_fn::<__m512i, 5, _>(|k| _mm512_set1_epi64(FP52_P[k] as i64));
+
+        // t = a + b (limb-wise, no modular reduction yet)
+        let mut t: [__m512i; 5] =
+            core::array::from_fn(|k| _mm512_add_epi64(a.limbs[k], b.limbs[k]));
+
+        // carry propagation
+        for k in 0..4 {
+            let carry = _mm512_srli_epi64(t[k], 52);
+            t[k] = _mm512_and_epi64(t[k], mask52);
+            t[k + 1] = _mm512_add_epi64(t[k + 1], carry);
+        }
+
+        // conditional subtract p: compute d = t - p with borrow chain
+        let (d, no_borrow) = sub_p_x8(t, &p, mask52);
+
+        // select: use d where t >= p (no_borrow), else use t
+        let result: [__m512i; 5] =
+            core::array::from_fn(|k| _mm512_mask_blend_epi64(no_borrow, t[k], d[k]));
+        U256x8 { limbs: result }
+    }
+
+    /// Compute `a - b mod p` for all 8 lanes.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub unsafe fn fp_sub_x8(a: U256x8, b: U256x8) -> U256x8 {
+        // compute b_neg = p - b, then a + b_neg
+        fp_add_x8(a, fp_neg_x8(b))
+    }
+
+    /// Compute `-a mod p` for all 8 lanes.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub unsafe fn fp_neg_x8(a: U256x8) -> U256x8 {
+        let mask52 = _mm512_set1_epi64(MASK52 as i64);
+        let zero = _mm512_setzero_si512();
+
+        // is_zero mask: lane is all-zero if all limbs are zero
+        // We use a conservative approach: compute p - a limb-wise with borrow.
+        let p: [__m512i; 5] = core::array::from_fn(|k| _mm512_set1_epi64(FP52_P[k] as i64));
+
+        // d = p - a with borrow chain; result[i] = (a[i] == 0) ? 0 : p - a
+        let (mut d, _) = sub_limbs_x8(p, a.limbs, mask52);
+
+        // zero out lanes where a was already zero (p - 0 should be 0, not p)
+        // Detect a==0: all limbs are 0 ⟹ limb[0]==0 suffices for values in [0,p)
+        let zero_mask = _mm512_cmpeq_epi64_mask(a.limbs[0], zero);
+        for k in 0..5 {
+            d[k] = _mm512_mask_blend_epi64(zero_mask, d[k], zero);
+        }
+
+        U256x8 { limbs: d }
+    }
+
+    // ── Field multiplication ──────────────────────────────────────────────────
+
+    /// Compute `a * b mod p` for all 8 lanes using VPMADD52 (AVX-512IFMA).
+    ///
+    /// Algorithm:
+    /// 1. Schoolbook 5×5 using madd52lo/hi → 10 product limb accumulators.
+    /// 2. Carry propagation → normalise to 52-bit limbs.
+    /// 3. Solinas fold: excess limbs t[5..9] are folded via 16K (= 2^4*(2^32+977),
+    ///    which fits in 37 bits, so the fold itself reuses madd52).
+    /// 4. Second carry propagation + conditional subtract.
+    ///
+    /// # Safety
+    /// Requires `avx512f`, `avx512ifma`.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub unsafe fn fp_mul_x8(a: U256x8, b: U256x8) -> U256x8 {
+        let [a0, a1, a2, a3, a4] = a.limbs;
+        let [b0, b1, b2, b3, b4] = b.limbs;
+        let z = _mm512_setzero_si512();
+
+        // ── Step 1: schoolbook 5×5 using VPMADD52LO/HI ───────────────────────
+        //
+        // t[k] accumulates contributions from all (i,j) pairs where i+j == k.
+        // madd52lo(acc, x, y)  adds (x*y) & MASK52 to acc.
+        // madd52hi(acc, x, y)  adds (x*y) >> 52 to acc.
+        // Both require x,y < 2^52; our limbs satisfy this.
+        //
+        // The hi contribution of (i,j) at position k = i+j naturally lands
+        // as a contribution to position k+1, so we place it in t[k+1].
+
+        macro_rules! mlo {
+            ($acc:expr, $a:expr, $b:expr) => {
+                _mm512_madd52lo_epu64($acc, $a, $b)
+            };
+        }
+        macro_rules! mhi {
+            ($acc:expr, $a:expr, $b:expr) => {
+                _mm512_madd52hi_epu64($acc, $a, $b)
+            };
+        }
+
+        let mut t = [z; 10];
+
+        // i = 0
+        t[0] = mlo!(t[0], a0, b0);
+        t[1] = mhi!(t[1], a0, b0);
+        t[1] = mlo!(t[1], a0, b1);
+        t[2] = mhi!(t[2], a0, b1);
+        t[2] = mlo!(t[2], a0, b2);
+        t[3] = mhi!(t[3], a0, b2);
+        t[3] = mlo!(t[3], a0, b3);
+        t[4] = mhi!(t[4], a0, b3);
+        t[4] = mlo!(t[4], a0, b4);
+        t[5] = mhi!(t[5], a0, b4);
+
+        // i = 1
+        t[1] = mlo!(t[1], a1, b0);
+        t[2] = mhi!(t[2], a1, b0);
+        t[2] = mlo!(t[2], a1, b1);
+        t[3] = mhi!(t[3], a1, b1);
+        t[3] = mlo!(t[3], a1, b2);
+        t[4] = mhi!(t[4], a1, b2);
+        t[4] = mlo!(t[4], a1, b3);
+        t[5] = mhi!(t[5], a1, b3);
+        t[5] = mlo!(t[5], a1, b4);
+        t[6] = mhi!(t[6], a1, b4);
+
+        // i = 2
+        t[2] = mlo!(t[2], a2, b0);
+        t[3] = mhi!(t[3], a2, b0);
+        t[3] = mlo!(t[3], a2, b1);
+        t[4] = mhi!(t[4], a2, b1);
+        t[4] = mlo!(t[4], a2, b2);
+        t[5] = mhi!(t[5], a2, b2);
+        t[5] = mlo!(t[5], a2, b3);
+        t[6] = mhi!(t[6], a2, b3);
+        t[6] = mlo!(t[6], a2, b4);
+        t[7] = mhi!(t[7], a2, b4);
+
+        // i = 3
+        t[3] = mlo!(t[3], a3, b0);
+        t[4] = mhi!(t[4], a3, b0);
+        t[4] = mlo!(t[4], a3, b1);
+        t[5] = mhi!(t[5], a3, b1);
+        t[5] = mlo!(t[5], a3, b2);
+        t[6] = mhi!(t[6], a3, b2);
+        t[6] = mlo!(t[6], a3, b3);
+        t[7] = mhi!(t[7], a3, b3);
+        t[7] = mlo!(t[7], a3, b4);
+        t[8] = mhi!(t[8], a3, b4);
+
+        // i = 4
+        t[4] = mlo!(t[4], a4, b0);
+        t[5] = mhi!(t[5], a4, b0);
+        t[5] = mlo!(t[5], a4, b1);
+        t[6] = mhi!(t[6], a4, b1);
+        t[6] = mlo!(t[6], a4, b2);
+        t[7] = mhi!(t[7], a4, b2);
+        t[7] = mlo!(t[7], a4, b3);
+        t[8] = mhi!(t[8], a4, b3);
+        t[8] = mlo!(t[8], a4, b4);
+        t[9] = mhi!(t[9], a4, b4);
+
+        // ── Step 2: carry propagation to normalise to 52-bit limbs ───────────
+        let mask52 = _mm512_set1_epi64(MASK52 as i64);
+        for k in 0..9 {
+            let carry = _mm512_srli_epi64(t[k], 52);
+            t[k] = _mm512_and_epi64(t[k], mask52);
+            t[k + 1] = _mm512_add_epi64(t[k + 1], carry);
+        }
+        // After propagation: t[0..8] < 2^52; t[9] < 2^4 (at most 1 partial product).
+
+        // ── Step 3: Solinas fold ──────────────────────────────────────────────
+        //
+        // p = 2^256 - K, K = 2^32 + 977.
+        // 2^(52*5) = 2^260 ≡ 2^4 * K = 16K  (mod p)   — fold mult. 16K ≈ 2^36.5.
+        // 2^(52*6) ≡ 2^4 * 2^52 * K → shifted by one limb, same 16K coefficient.
+        // Generally: limb position (5+j) reduces to limb position j with factor 16K.
+        //
+        // 16K = 16 * (2^32 + 977) = 2^36 + 15 632 < 2^37 < 2^52  ✓ fits in 52 bits,
+        // so each fold step is itself a single pair of madd52lo/hi.
+        //
+        // t[9] * 16K < 2^4 * 2^37 = 2^41 < 2^52, so madd52hi of t[9] is zero.
+        let fk = _mm512_set1_epi64((16u64 * ((1u64 << 32) + 977)) as i64);
+
+        // Fold t[5] → positions 0, 1
+        t[0] = mlo!(t[0], t[5], fk);
+        t[1] = mhi!(t[1], t[5], fk);
+        // Fold t[6] → positions 1, 2
+        t[1] = mlo!(t[1], t[6], fk);
+        t[2] = mhi!(t[2], t[6], fk);
+        // Fold t[7] → positions 2, 3
+        t[2] = mlo!(t[2], t[7], fk);
+        t[3] = mhi!(t[3], t[7], fk);
+        // Fold t[8] → positions 3, 4
+        t[3] = mlo!(t[3], t[8], fk);
+        t[4] = mhi!(t[4], t[8], fk);
+        // Fold t[9] → position 4 (lo52) and position 5 residual (hi52).
+        t[4] = mlo!(t[4], t[9], fk);
+        let hi9 = _mm512_madd52hi_epu64(_mm512_setzero_si512(), t[9], fk);
+        // hi9 at position 5 → fold to position 0 (lo52) and position 1 (hi52).
+        // hi9 * fk < 2^34 * 2^37 = 2^71; lo part < 2^52, hi part < 2^19.
+        t[0] = mlo!(t[0], hi9, fk);
+        t[1] = mhi!(t[1], hi9, fk); // < 2^19, negligible, absorbed by cond-sub
+
+        // ── Step 4: second carry propagation ─────────────────────────────────
+        // The fold may have inflated t[0..4] beyond 2^52; propagate carries again.
+        for k in 0..4 {
+            let carry = _mm512_srli_epi64(t[k], 52);
+            t[k] = _mm512_and_epi64(t[k], mask52);
+            t[k + 1] = _mm512_add_epi64(t[k + 1], carry);
+        }
+        // Tiny chance t[4] still overflowed its 48-bit budget; handle via a
+        // second Solinas pass on the carry out of limb 4.
+        // carry4 < 2^6 (at most a few extra bits), K < 2^33, product < 2^39 < 2^52
+        // so a single madd52lo into t[0] suffices; the hi bit is always 0.
+        let carry4 = _mm512_srli_epi64(t[4], 48);
+        t[4] = _mm512_and_epi64(t[4], _mm512_set1_epi64(((1u64 << 48) - 1) as i64));
+        let k_splat = _mm512_set1_epi64(((1u64 << 32) + 977) as i64);
+        t[0] = mlo!(t[0], carry4, k_splat); // K*carry4 < 2^39 < 2^52, hi=0
+        // Re-normalise limb 0 (small carry possible into limb 1)
+        let c0 = _mm512_srli_epi64(t[0], 52);
+        t[0] = _mm512_and_epi64(t[0], mask52);
+        t[1] = _mm512_add_epi64(t[1], c0);
+
+        // ── Step 5: conditional subtract p ───────────────────────────────────
+        let p: [__m512i; 5] = core::array::from_fn(|k| _mm512_set1_epi64(FP52_P[k] as i64));
+        let (d, no_borrow) = sub_p_x8([t[0], t[1], t[2], t[3], t[4]], &p, mask52);
+        let result: [__m512i; 5] =
+            core::array::from_fn(|k| _mm512_mask_blend_epi64(no_borrow, t[k], d[k]));
+        U256x8 { limbs: result }
+    }
+
+    /// Compute `a^2 mod p` for all 8 lanes.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub unsafe fn fp_sq_x8(a: U256x8) -> U256x8 {
+        fp_mul_x8(a, a)
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    /// Compute `t - p` with 5-limb borrow chain.
+    /// Returns `(diff, no_borrow_mask)` where bit `i` of `no_borrow_mask` is
+    /// set iff lane `i` had no final borrow (i.e., `t[i] >= p`).
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    unsafe fn sub_p_x8(
+        t: [__m512i; 5],
+        p: &[__m512i; 5],
+        mask52: __m512i,
+    ) -> ([__m512i; 5], __mmask8) {
+        sub_limbs_x8(t, *p, mask52)
+    }
+
+    /// Generic 5-limb modular subtract `a - b` with borrow chain.
+    /// The `borrow` returned is per-lane: 1 if the subtraction underflowed.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    unsafe fn sub_limbs_x8(
+        a: [__m512i; 5],
+        b: [__m512i; 5],
+        mask52: __m512i,
+    ) -> ([__m512i; 5], __mmask8) {
+        // We work with 53-bit slots: add 2^52 as a "virtual borrow slot" so
+        // the subtraction remains representable in u64.
+        let base = _mm512_set1_epi64((1u64 << 52) as i64);
+        let one = _mm512_set1_epi64(1i64);
+        let zero = _mm512_setzero_si512();
+
+        let mut d = [zero; 5];
+        let mut borrow = zero; // 0 or 1 per lane
+
+        for k in 0..5 {
+            // d[k] = a[k] + 2^52 - b[k] - borrow_in
+            let mut v = _mm512_add_epi64(a[k], base);
+            v = _mm512_sub_epi64(v, b[k]);
+            v = _mm512_sub_epi64(v, borrow);
+            // borrow_out = 1 if the slot didn't have enough, i.e. v < 2^52
+            borrow = _mm512_sub_epi64(one, _mm512_srli_epi64(v, 52));
+            d[k] = _mm512_and_epi64(v, mask52);
+        }
+        // no_borrow_mask: bit i set iff borrow[lane i] == 0 (t >= p)
+        let no_borrow_mask = _mm512_cmpeq_epi64_mask(borrow, zero);
+        (d, no_borrow_mask)
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+    #[cfg(test)]
+    mod tests_x8 {
+        use super::*;
+
+        fn check_avx512() -> bool {
+            is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512ifma")
+        }
+
+        /// Round-trip: to_52bit / from_52bit identity.
+        #[test]
+        fn test_52bit_roundtrip() {
+            let v = [P0, P1, P2, P3];
+            assert_eq!(from_52bit(to_52bit(v)), v, "round-trip failed");
+            let v2 = [
+                0x0102030405060708u64,
+                0xFEDCBA9876543210,
+                0xDEADBEEFCAFEBABE,
+                0x0000000000000001,
+            ];
+            assert_eq!(from_52bit(to_52bit(v2)), v2, "round-trip failed for v2");
+        }
+
+        /// fp_mul_x8 must agree with scalar_fp_mul for 8 lanes.
+        #[test]
+        fn test_fp_mul_x8_matches_scalar() {
+            if !check_avx512() {
+                return;
+            }
+            // Use known primes and random-ish values
+            let a_val = [
+                0x59F2815B16F81798u64,
+                0x029BFCDB2DCE28D9,
+                0x55A06295CE870B07,
+                0x79BE667EF9DCBBAC,
+            ];
+            let b_val = [
+                0xFFFFFFFEFFFFFC2Eu64,
+                0xFFFFFFFFFFFFFFFF,
+                0xFFFFFFFFFFFFFFFF,
+                0xFFFFFFFFFFFFFFFF,
+            ];
+            let a_u256 = U256(a_val);
+            let b_u256 = U256(b_val);
+            let expected = scalar_fp_mul(&a_u256, &b_u256);
+
+            let a8 = unsafe { load(&[a_val; 8]) };
+            let b8 = unsafe { load(&[b_val; 8]) };
+            let c8 = unsafe { fp_mul_x8(a8, b8) };
+            let got = unsafe { store(c8) };
+
+            for lane in 0..8 {
+                let got_u256 = U256(got[lane]);
+                assert_eq!(
+                    got_u256, expected,
+                    "fp_mul_x8 lane {lane} mismatch: got {:?} expected {:?}",
+                    got[lane], expected.0
+                );
+            }
+        }
+
+        /// fp_add_x8 + fp_neg_x8: a + (-a) == 0.
+        #[test]
+        fn test_fp_add_neg_x8() {
+            if !check_avx512() {
+                return;
+            }
+            let a_val = [
+                0x59F2815B16F81798u64,
+                0x029BFCDB2DCE28D9,
+                0x55A06295CE870B07,
+                0x79BE667EF9DCBBAC,
+            ];
+            let a8 = unsafe { load(&[a_val; 8]) };
+            let neg_a8 = unsafe { fp_neg_x8(a8) };
+            let sum8 = unsafe { fp_add_x8(a8, neg_a8) };
+            let got = unsafe { store(sum8) };
+            for lane in 0..8 {
+                assert_eq!(got[lane], [0u64; 4], "a + (-a) != 0 at lane {lane}");
+            }
+        }
+
+        /// fp_sq_x8(a) == scalar_fp_mul(a, a).
+        #[test]
+        fn test_fp_sq_x8_matches_scalar() {
+            if !check_avx512() {
+                return;
+            }
+            let a_val = [
+                0x59F2815B16F81798u64,
+                0x029BFCDB2DCE28D9,
+                0x55A06295CE870B07,
+                0x79BE667EF9DCBBAC,
+            ];
+            let a_u256 = U256(a_val);
+            let expected = scalar_fp_mul(&a_u256, &a_u256);
+            let a8 = unsafe { load(&[a_val; 8]) };
+            let c8 = unsafe { fp_sq_x8(a8) };
+            let got = unsafe { store(c8) };
+            for lane in 0..8 {
+                assert_eq!(U256(got[lane]), expected, "fp_sq_x8 lane {lane} mismatch");
+            }
+        }
+
+        /// fp_mul_x8 with one = 1: a * 1 == a.
+        #[test]
+        fn test_fp_mul_by_one_x8() {
+            if !check_avx512() {
+                return;
+            }
+            let a_val = [
+                0x59F2815B16F81798u64,
+                0x029BFCDB2DCE28D9,
+                0x55A06295CE870B07,
+                0x79BE667EF9DCBBAC,
+            ];
+            let one_val = [1u64, 0, 0, 0];
+            let a8 = unsafe { load(&[a_val; 8]) };
+            let one8 = unsafe { load(&[one_val; 8]) };
+            let c8 = unsafe { fp_mul_x8(a8, one8) };
+            let got = unsafe { store(c8) };
+            for lane in 0..8 {
+                assert_eq!(got[lane], a_val, "a * 1 != a at lane {lane}");
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Per-lane scalar ecrecover (the kernel dispatched 8× in parallel from the
 // public API, or as scalar fallback outside AVX-512 environments)
 // ─────────────────────────────────────────────────────────────────────────────
