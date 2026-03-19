@@ -648,3 +648,32 @@ Differences vs. C: Rust `i128`/`u128` replace the `secp256k1_int128` helper; `u6
 Addition cost for G scalars drops from ~32 additions/scalar (window 5) to ~9 additions/scalar (window 15), a 78% reduction.
 
 **Build:** 13/13 `ecdsa_clone` tests pass.
+
+---
+
+## 2026-03-19 — RDTSC phase timeline
+
+### Prompt
+> Can we add rdtsc timing to various points in the code to get a timeline of execution?
+
+### High-level effects
+
+- Additional `pub` items exposed from `ecdsa_clone`: `WINDOW_A`, `TABLE_SIZE`, `WINDOW_G`, `BETA`, `scalar_split_lambda`, `scalar_split_128`, `build_odd_multiples_table`, `ecmult_wnaf`, `table_get_ge`, `table_get_ge_lambda`, `PRE_G_DATA`, `PRE_G128_DATA`, `g_table_get_ge`.
+- New example `examples/timeline_ecdsa.rs`: calls each phase individually, samples cycle counts with `_rdtsc()`, reports median and p95 over 10 000 iterations.
+
+**Phase breakdown (median cycles @ ~5.4 GHz, n = 10 000):**
+
+| Phase | Cycles | % |
+|---|---|---|
+| §1 ge_set_xo_var (R recovery, fe_sqrt) | 8 250 | 12.9% |
+| §2 scalar_inv_var (safegcd 1/r) | 1 500 | 2.3% |
+| §3 scalar_mul × 2 (u1, u2) | 101 | 0.2% |
+| §4 scalar_split (GLV + 128-bit) | 175 | 0.3% |
+| §5 build_odd_multiples_table + aux | 6 650 | 10.4% |
+| §6 ecmult_wnaf × 4 | 699 | 1.1% |
+| **§7 ecmult main loop (~129 iters)** | **43 875** | **68.4%** |
+| §8 ge_set_gej_var (normalise Q) | 1 575 | 2.5% |
+| §9 keccak256 | 474 | 0.7% |
+| **TOTAL** | **64 125** | |
+
+The ecmult main loop (doublings + mixed-addition table lookups) dominates at 68% of total cost. Next priorities: §1 ge_set_xo_var (13%) and §5 build A table (10%).
