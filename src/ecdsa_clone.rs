@@ -72,7 +72,7 @@ impl Fe {
             n: [v as u64, 0, 0, 0, 0],
         }
     }
-    pub fn set_b32_mod(b: &[u8; 32]) -> Self {
+    pub const fn set_b32_mod(b: &[u8; 32]) -> Self {
         // C: $BASE/field_5x52_impl.h – `fe_impl_set_b32_mod`
         Fe {
             n: [
@@ -1122,30 +1122,30 @@ const SECP256K1_B: i32 = 7;
 // Generator point G.
 // C: $BASE/group_impl.h – `static const rustsecp256k1_v0_10_0_ge rustsecp256k1_v0_10_0_ge_const_g = SECP256K1_G;`
 // The constant is given in big-endian 32-bit words.
-fn G() -> Ge {
-    Ge {
-        x: Fe::set_b32_mod(&hex32(
-            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-        )),
-        y: Fe::set_b32_mod(&hex32(
-            "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
-        )),
-        infinity: false,
-    }
-}
-fn hex32(s: &str) -> [u8; 32] {
+const G: Ge = Ge {
+    x: Fe::set_b32_mod(&hex32(
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    )),
+    y: Fe::set_b32_mod(&hex32(
+        "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+    )),
+    infinity: false,
+};
+const fn hex32(s: &str) -> [u8; 32] {
+    let b = s.as_bytes();
     let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        let hi = s.as_bytes()[2 * i];
-        let lo = s.as_bytes()[2 * i + 1];
-        *b = (hex_nibble(hi) << 4) | hex_nibble(lo);
+    let mut i = 0;
+    while i < 32 {
+        out[i] = (hex_nibble(b[2 * i]) << 4) | hex_nibble(b[2 * i + 1]);
+        i += 1;
     }
     out
 }
-fn hex_nibble(c: u8) -> u8 {
+const fn hex_nibble(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => c - b'0',
         b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
         _ => panic!("bad hex char"),
     }
 }
@@ -1534,11 +1534,9 @@ const G2_GLV: Scalar = Scalar {
 // β: field cube-root of unity,  β³ ≡ 1 (mod p).
 // C: $BASE/field.h  `const_beta`
 // SECP256K1_FE_CONST: 0x7ae96a2b 657c0710 6e64479e ac3434e9 9cf04975 12f58995 c1396c28 719501ee
-fn beta_fe() -> Fe {
-    Fe::set_b32_mod(&hex32(
-        "7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee",
-    ))
-}
+const BETA: Fe = Fe::set_b32_mod(&hex32(
+    "7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee",
+));
 
 // ── Scalar helpers ────────────────────────────────────────────────────────────
 
@@ -1752,7 +1750,7 @@ fn table_get_ge_lambda(pre: &[Ge; TABLE_SIZE], aux: &[Fe; TABLE_SIZE], n: i32) -
 fn g_tables() -> &'static ([Ge; TABLE_SIZE], [Ge; TABLE_SIZE]) {
     static CACHE: OnceLock<([Ge; TABLE_SIZE], [Ge; TABLE_SIZE])> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let g_jac = Gej::set_ge(&G());
+        let g_jac = Gej::set_ge(&G);
         let pre_g = build_odd_multiples_table(&g_jac);
         let g128_jac = (0..128u32).fold(g_jac, |acc, _| gej_double(&acc));
         let pre_g128 = build_odd_multiples_table(&g128_jac);
@@ -1779,7 +1777,7 @@ pub fn ecmult(a: &Gej, u2: &Scalar, u1: &Scalar) -> Gej {
     // pre_a[i] = (2i+1)·A   (affine)
     // aux[i]   = β · pre_a[i].x  (for the λ·A endomorphism points)
     let pre_a = build_odd_multiples_table(a);
-    let beta = beta_fe();
+    let beta = BETA;
     let mut aux = [Fe { n: [0; 5] }; TABLE_SIZE];
     for i in 0..TABLE_SIZE {
         aux[i] = fe_mul(&pre_a[i].x, &beta);
@@ -1841,18 +1839,14 @@ pub fn ecmult(a: &Gej, u2: &Scalar, u1: &Scalar) -> Gej {
 
 // C: $BASE/ecdsa_impl.h – group order n expressed as field element
 // `static const secp256k1_fe secp256k1_ecdsa_const_order_as_fe`
-fn order_as_fe() -> Fe {
-    Fe::set_b32_mod(&hex32(
-        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
-    ))
-}
+const ORDER_AS_FE: Fe = Fe::set_b32_mod(&hex32(
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+));
 // C: $BASE/ecdsa_impl.h – `static const secp256k1_fe secp256k1_ecdsa_const_p_minus_order`
 // p - n = 0x14551231950b75fc4402da1722fc9baee
-fn p_minus_order() -> Fe {
-    Fe::set_b32_mod(&hex32(
-        "000000000000000000000000000000014551231950B75FC4402DA1722FC9BAEE",
-    ))
-}
+const P_MINUS_ORDER: Fe = Fe::set_b32_mod(&hex32(
+    "000000000000000000000000000000014551231950B75FC4402DA1722FC9BAEE",
+));
 
 /// Core ECDSA key recovery.
 ///
@@ -1874,10 +1868,10 @@ pub fn ecdsa_sig_recover(sigr: &Scalar, sigs: &Scalar, message: &Scalar, recid: 
     // recid bit 1: r >= p-n means we add n to get fx
     // C: $BASE/modules/recovery/main_impl.h lines ~108-113
     if recid & 2 != 0 {
-        if fx.cmp_var(&p_minus_order()) >= 0 {
+        if fx.cmp_var(&P_MINUS_ORDER) >= 0 {
             return None;
         }
-        let mut order_fe = order_as_fe();
+        let mut order_fe = ORDER_AS_FE;
         fe_add(&mut fx, &order_fe);
     }
 
@@ -2007,7 +2001,7 @@ mod debug_tests {
     #[test]
     fn test_double_g_x() {
         // 2G x-coordinate = C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5
-        let g_ge = G();
+        let g_ge = G;
         let g_jac = Gej::set_ge(&g_ge);
         let g2 = gej_double(&g_jac);
         let g2_aff = ge_set_gej_var(&g2);
@@ -2020,7 +2014,7 @@ mod debug_tests {
 
     #[test]
     fn test_g_on_curve() {
-        let g = G();
+        let g = G;
         let x2 = fe_sqr(&g.x);
         let mut x3 = fe_mul(&x2, &g.x);
         fe_add_int(&mut x3, 7);
@@ -2032,7 +2026,7 @@ mod debug_tests {
 
     #[test]
     fn test_fe_sqr_vs_mul() {
-        let g = G();
+        let g = G;
         let mut s1 = fe_sqr(&g.x);
         let mut s2 = fe_mul(&g.x, &g.x);
         s1.normalize();
@@ -2043,7 +2037,7 @@ mod debug_tests {
     #[test]
     fn test_fe_inv() {
         // a * fe_inv(a) == 1 mod p, using G.x
-        let g = G();
+        let g = G;
         let inv_x = fe_inv(&g.x);
         let mut product = fe_mul(&g.x, &inv_x);
         product.normalize();
@@ -2065,7 +2059,7 @@ mod debug_tests {
     #[test]
     fn test_double_g_z() {
         // 2G.z = G.y + G.z = G.y (Jacobian: z3 = y1*z1 = G.y*1 = G.y)
-        let g_ge = G();
+        let g_ge = G;
         let g_jac = Gej::set_ge(&g_ge);
         let g2 = gej_double(&g_jac);
         // z3 = G.y * G.z = G.y * 1 = G.y (before normalization)
