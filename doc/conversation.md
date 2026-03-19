@@ -1159,3 +1159,42 @@ Results on this hardware (N=5000 batches of 8, release build):
 The vectorised batch path now beats the highly-tuned libsecp256k1 C library by
 **~1.4× per lane** on the same-signature workload and is slightly faster on the
 varied-hash workload.  45/45 tests still pass.
+
+---
+
+## Prompt: "Add CI, crate metadata, README, examples, doc/internals.md"
+
+**Commit:** `caed51b  meta: CI workflow, crate metadata, README, examples, doc/internals.md`
+
+Six files added or modified:
+
+**`.github/workflows/ci.yml`** — GitHub Actions CI that runs on push/PR to
+master/main.  Steps: rustfmt check, clippy, `cargo test --all`, and
+`cargo build --examples --release`.  Uses `RUSTFLAGS="-C target-cpu=native"`
+so AVX-512 fast paths are exercised on the CI runner.
+
+**`Cargo.toml`** — Added publishing metadata: `description`, `license`
+(MIT OR Apache-2.0), `repository`, `documentation`, `readme`, `keywords`,
+`categories`.  Added `[[example]]` entries for `keccak_batch` and
+`ecdsa_batch`.
+
+**`README.md`** — New file.  Badges for CI, crates.io, docs.rs.  Benchmark
+tables showing asmcrypto vs secp256k1 C library (ECDSA: 64 vs 46 krecov/s;
+Keccak: 6× speedup).  Performance boast paragraph noting the ~1.4× per-lane
+lead over libsecp256k1 and projecting further gains from hand-written
+assembly for `fp_mul_x8` and the scalar multipliers.  Quick-start code
+examples.  Links to `doc/internals.md`.
+
+**`examples/keccak_batch.rs`** — Instructional example hashing 8 named
+messages simultaneously, cross-checking lane 0 against scalar keccak256.
+
+**`examples/ecdsa_batch.rs`** — Instructional example recovering 8 Ethereum
+addresses from the ECDSA precompile test vector, printing tick marks next to
+each lane and cross-checking against the scalar path.
+
+**`doc/internals.md`** — Algorithm reference covering: Keccak-256 sponge
+construction and the ZMM interleaving strategy (§1); secp256k1 field
+arithmetic in 52-bit IFMA representation, GLV endomorphism, wNAF scalar
+multiplication, batch affine conversion via Montgomery batch inversion, Phase
+1a/1b vectorisation design, invalid-lane handling (§2); planned hand-written
+assembly optimisations and estimated 1.5–2× further speedup (§3).
