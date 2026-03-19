@@ -1021,8 +1021,9 @@ fn scalar_mul_affine(scalar: &U256, px: &U256, py: &U256) -> JacPt {
 pub mod x8 {
     #![allow(unsafe_op_in_unsafe_fn)]
     use super::{
-        P0, P1, P2, P3, U256, scalar_fn_inv, scalar_fn_mul, scalar_fn_neg, scalar_fp_add,
-        scalar_fp_mul, scalar_fp_neg, scalar_fp_sq, scalar_fp_sqrt,
+        JacPt, P0, P1, P2, P3, U256, pt_double, scalar_fn_inv, scalar_fn_mul, scalar_fn_neg,
+        scalar_fp_add, scalar_fp_inv, scalar_fp_mul, scalar_fp_neg, scalar_fp_sq, scalar_fp_sqrt,
+        scalar_fp_sub,
     };
     use core::arch::x86_64::*;
 
@@ -1997,6 +1998,78 @@ pub mod x8 {
         r
     }
 
+    // ── Jacobian point (8 lanes) ──────────────────────────────────────────────
+
+    /// Eight parallel Jacobian points on secp256k1.
+    ///
+    /// Each lane represents the projective point (X : Y : Z) corresponding to
+    /// affine (X/Z², Y/Z³).  A lane with `z == 0` is the point at infinity.
+    #[derive(Clone, Copy)]
+    pub struct JacPtx8 {
+        pub x: U256x8,
+        pub y: U256x8,
+        pub z: U256x8,
+    }
+
+    /// Compute `2·P` for all 8 lanes using the dbl-2009-l formula (secp256k1, a=0).
+    ///
+    /// Reference: <https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-0.html#doubling-dbl-2009-l>
+    ///
+    /// ```text
+    /// A = X₁²;  B = Y₁²;  C = B²
+    /// D = 2·((X₁+B)²−A−C)
+    /// E = 3·A;   F = E²
+    /// X₃ = F − 2D
+    /// Y₃ = E·(D−X₃) − 8C
+    /// Z₃ = 2·Y₁·Z₁
+    /// ```
+    ///
+    /// Infinity propagates naturally: Z₁=0 ⟹ Z₃=2·Y₁·Z₁=0.
+    ///
+    /// Cost: 5 field squarings, 2 field multiplications.
+    ///
+    /// # Safety
+    /// Requires `avx512f`, `avx512ifma`.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub unsafe fn pt_double_x8(p: JacPtx8) -> JacPtx8 {
+        let JacPtx8 {
+            x: x1,
+            y: y1,
+            z: z1,
+        } = p;
+
+        let a = fp_sq_x8(x1); // A = X1²
+        let b = fp_sq_x8(y1); // B = Y1²
+        let c = fp_sq_x8(b); // C = B²
+
+        // D = 2·((X1+B)²−A−C)
+        let x1pb = fp_add_x8(x1, b);
+        let d_half = fp_sub_x8(fp_sub_x8(fp_sq_x8(x1pb), a), c);
+        let d = fp_add_x8(d_half, d_half);
+
+        // E = 3·A
+        let e = fp_add_x8(fp_add_x8(a, a), a);
+
+        // F = E²;  X3 = F − 2D
+        let f = fp_sq_x8(e);
+        let x3 = fp_sub_x8(f, fp_add_x8(d, d));
+
+        // Y3 = E·(D−X3) − 8C
+        let two_c = fp_add_x8(c, c);
+        let eight_c = fp_add_x8(fp_add_x8(two_c, two_c), fp_add_x8(two_c, two_c));
+        let y3 = fp_sub_x8(fp_mul_x8(e, fp_sub_x8(d, x3)), eight_c);
+
+        // Z3 = 2·Y1·Z1
+        let y1z1 = fp_mul_x8(y1, z1);
+        let z3 = fp_add_x8(y1z1, y1z1);
+
+        JacPtx8 {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────────
     #[cfg(test)]
     mod tests_x8 {
@@ -2219,6 +2292,77 @@ pub mod x8 {
             let got = unsafe { store(c8) };
             for lane in 0..8 {
                 assert_eq!(got[lane], a_val, "fn_mul_x8: a * 1 != a at lane {lane}");
+            }
+        }
+
+        /// pt_double_x8 matches scalar pt_double (converted to affine).
+        #[test]
+        fn test_pt_double_x8_matches_scalar() {
+            if !check_avx512() {
+                return;
+            }
+            // Helper: convert per-lane raw Jacobian (x,y,z) → affine using scalar fp ops.
+            let to_affine_scalar = |rx: [u64; 4], ry: [u64; 4], rz: [u64; 4]| -> (U256, U256) {
+                let z = U256(rz);
+                let z_inv = scalar_fp_inv(&z).expect("z should be nonzero");
+                let z2 = scalar_fp_sq(&z_inv);
+                let z3 = scalar_fp_mul(&z2, &z_inv);
+                (scalar_fp_mul(&U256(rx), &z2), scalar_fp_mul(&U256(ry), &z3))
+            };
+
+            // Test with the generator G (affine, so Z=1).
+            let gx = U256([
+                0x59F2815B16F81798,
+                0x029BFCDB2DCE28D9,
+                0x55A06295CE870B07,
+                0x79BE667EF9DCBBAC,
+            ]);
+            let gy = U256([
+                0x9C47D08FFB10D4B8,
+                0xFD17B448A6855419,
+                0x5DA4FBFC0E1108A8,
+                0x483ADA7726A3C465,
+            ]);
+            let one = [1u64, 0, 0, 0];
+
+            // Scalar reference: 2·G
+            let g_jac = JacPt::from_affine(gx, gy);
+            let two_g_jac = pt_double(&g_jac);
+            let (ref_x, ref_y) = two_g_jac.to_affine().expect("2G should not be infinity");
+
+            // Vectorised: load G into all 8 lanes.
+            let p8 = JacPtx8 {
+                x: unsafe { load(&[gx.0; 8]) },
+                y: unsafe { load(&[gy.0; 8]) },
+                z: unsafe { load(&[one; 8]) },
+            };
+            let d8 = unsafe { pt_double_x8(p8) };
+            let rxs = unsafe { store(d8.x) };
+            let rys = unsafe { store(d8.y) };
+            let rzs = unsafe { store(d8.z) };
+
+            for lane in 0..8 {
+                let (ax, ay) = to_affine_scalar(rxs[lane], rys[lane], rzs[lane]);
+                assert_eq!(ax, ref_x, "pt_double_x8 x mismatch at lane {lane}");
+                assert_eq!(ay, ref_y, "pt_double_x8 y mismatch at lane {lane}");
+            }
+
+            // Also verify 2·(2·G) = 4·G by doubling twice.
+            let p2 = JacPtx8 {
+                x: d8.x,
+                y: d8.y,
+                z: d8.z,
+            };
+            let d2_8 = unsafe { pt_double_x8(p2) };
+            let four_g_jac = pt_double(&two_g_jac);
+            let (ref4_x, ref4_y) = four_g_jac.to_affine().expect("4G should not be infinity");
+            let rxs2 = unsafe { store(d2_8.x) };
+            let rys2 = unsafe { store(d2_8.y) };
+            let rzs2 = unsafe { store(d2_8.z) };
+            for lane in 0..8 {
+                let (ax, ay) = to_affine_scalar(rxs2[lane], rys2[lane], rzs2[lane]);
+                assert_eq!(ax, ref4_x, "pt_double_x8 4G x mismatch at lane {lane}");
+                assert_eq!(ay, ref4_y, "pt_double_x8 4G y mismatch at lane {lane}");
             }
         }
 
