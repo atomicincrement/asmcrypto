@@ -967,3 +967,64 @@ Why dbl-2009-l instead of cloning the scalar `pt_double`:
 - Repeats for 4G = 2·(2·G) by doubling twice.
 
 All 41 tests pass (41 passed, 0 failed).
+
+---
+
+## 2026-03-19 — EC point arithmetic and scalar multiplication (x8)
+
+### Prompt
+> do the rest of the functions required before the full vector function.
+
+### High-level effects
+
+All remaining EC point arithmetic functions needed to fully vectorise
+`recover_addresses_avx512` are now implemented in `src/ecdsa_batch.rs`
+inside the `x8` module.
+
+**`blend_x8(mask, on_true, on_false) -> U256x8`**
+Lane-wise `__mmask8` blend of two `U256x8` values (wraps `vmovdqa64 {k}`).
+
+**`blend_jacpt_x8(mask, on_true, on_false) -> JacPtx8`**
+Per-axis wrapper of `blend_x8` for full Jacobian points.
+
+**`pt_add_mixed_x8(p: JacPtx8, qx: U256x8, qy: U256x8) -> JacPtx8`**
+Mixed Jacobian + affine add (madd-2007-bl, Z₂=1).  Cost: 4 sq + 4 mul.
+Infinity propagation: Z₁=0 detected by OR-ing all 5 limb lanes and
+comparing to zero; those lanes return (qx, qy, 1) via `blend_jacpt_x8`.
+
+**`pt_add_x8(p: JacPtx8, q: JacPtx8) -> JacPtx8`**
+Full Jacobian + Jacobian add (add-2007-bl).  Cost: 6 sq + 7 mul.
+Handles Z₁=0 → result=q; Z₂=0 → result=p via two `blend_jacpt_x8` calls.
+Note: H=0 (same-point doubling) gives Z=0; callers must avoid adding a
+point to itself (the GLV/wNAF loop never does this).
+
+**`scalar_mul_g_x8(scalars: [U256; 8]) -> JacPtx8`**
+8-lane GLV + width-5 wNAF scalar multiplication by the fixed generator G.
+Algorithm mirrors the scalar `scalar_mul_g`:
+- GLV decompose each scalar → two ~128-bit halves k₁, k₂.
+- Compute wNAF(k₁) and wNAF(k₂) for each lane.
+- Run 131-step doubling-and-add loop:
+  - `pt_double_x8(acc)` — always; Z=0 propagates correctly for unset lanes.
+  - Per-step scalar gather from G_TABLE / PHI_G_TABLE (8 lanes × 8-entry
+    precomputed affine table, always in L1) into two `U256x8` pairs.
+  - `pt_add_mixed_x8(acc, gx8, gy8)` for non-zero NAF digits.
+  - `blend_jacpt_x8(add_mask, new_acc, acc)` to skip zero-digit lanes.
+
+**`scalar_mul_affine_x8(scalars, px_arr, py_arr) -> JacPtx8`**
+8-lane GLV + width-5 wNAF scalar mul by variable affine points.
+Per-lane Jacobian wNAF tables built in scalar code (8×8 JacPt each for
+GLV components), then the main loop uses `pt_add_x8` (Jacobian + Jacobian)
+rather than the mixed form.
+
+**`to_affine_x8(p: JacPtx8) -> [(U256, U256); 8]`**
+Batch Jacobian → affine conversion using Montgomery's trick:
+3×7=21 field multiplications + 1 `scalar_fp_inv`, vs 8 individual
+inversions.
+
+**Tests added (4 new, 45 total):**
+- `test_pt_add_mixed_x8_matches_scalar` — G+3G=4G; also Z=0 sentinel lane.
+- `test_pt_add_x8_matches_scalar` — G+2G=3G via Jacobian+Jacobian.
+- `test_scalar_mul_g_x8_matches_scalar` — k∈{1..8}; compares to scalar reference.
+- `test_scalar_mul_affine_x8_matches_scalar` — alternates G/3G base, scalars {2..9}.
+
+All 45 tests pass (45 passed, 0 failed).
