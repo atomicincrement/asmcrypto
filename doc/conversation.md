@@ -677,3 +677,38 @@ Addition cost for G scalars drops from ~32 additions/scalar (window 5) to ~9 add
 | **TOTAL** | **64 125** | |
 
 The ecmult main loop (doublings + mixed-addition table lookups) dominates at 68% of total cost. Next priorities: §1 ge_set_xo_var (13%) and §5 build A table (10%).
+
+---
+
+## 2026-03-19 — AVX-512 batch Keccak-256 (keccak_batch)
+
+### Prompt
+> Create a new module keccak_batch with a function keccak256_batch for x86_64 only which takes eight input byte streams [&[u8]; 8] and outputs eight 256 bit hashes. Use avx512bw intrinsics to hold the state in 25 zmm registers.
+
+### High-level effects
+
+New module `src/keccak_batch.rs` with `pub fn keccak256_batch(inputs: [&[u8]; 8]) -> [[u8; 32]; 8]`.
+
+**Architecture:**
+- 25 ZMM registers (`[__m512i; 25]`) hold all 8 parallel Keccak-f[1600] states simultaneously: `ZMM[lane]` = `[stream7.lane, …, stream0.lane]`
+- One `permute()` call advances all 8 states with a single pass through θ → ρ+π → χ → ι
+
+**Implementation:**
+- **θ**: 5 column XORs (xor5 helper), 5 D[x] = C[x−1] ^ rol(C[x+1], 1), scatter XOR into all 25 lanes
+- **ρ+π**: 25 explicit `_mm512_rol_epi64` with compile-time immediate constants (mapping precomputed offline)
+- **χ**: 25 `xor(b[i], andnot(b[x+1,y], b[x+2,y]))` — branchless using `_mm512_andnot_si512`
+- **ι**: 1 `_mm512_xor_si512` with `_mm512_set1_epi64(RC[round])`
+- **Absorb**: 17 `_mm512_set_epi64` calls load 8 little-endian u64 lanes (one per stream) into a ZMM, then XOR into state; then `permute()`
+- **Squeeze**: store ZMM[0..4] to temp arrays, scatter 8-byte slices to 8 per-stream output buffers
+- **Variable-length inputs**: shared complete blocks absorbed vectorially; diverging final blocks built per-stream into padded `[u8; 136]` arrays, then batch-absorbed; if block counts differ, scalar fallback via `extract_scalar_state` + `finish_scalar`
+- Runtime `is_x86_feature_detected!` guard; scalar fallback on non-AVX-512 CPUs
+
+**Benchmark (200 000 iters, 64-byte inputs, release):**
+
+| | µs/batch | ns/hash |
+|---|---|---|
+| scalar × 8 | 1.495 | 186.9 |
+| `keccak256_batch` × 8 | **0.242** | **30.2** |
+| gain | **6.18×** | |
+
+**Tests:** 3 new batch tests (empty, various lengths, uniform 64-byte) — all cross-checked against scalar references. 7/7 keccak tests pass.
