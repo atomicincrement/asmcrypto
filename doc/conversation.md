@@ -592,3 +592,28 @@ Differences vs. C: Rust `i128`/`u128` replace the `secp256k1_int128` helper; `u6
 - Two new tests: `test_fe_inv_var_safegcd`, `test_scalar_inv_var_safegcd` — cross-check safegcd vs. Fermat and verify a·a⁻¹ = 1
 
 **Build:** 13/13 `ecdsa_clone` tests pass, zero errors, commit `9b54dab`.
+
+---
+
+## 2026-03-19 — Wire safegcd into hot path
+
+### Prompt
+> Add modinv64 to the hot path and re-run.
+
+### High-level effects
+
+- Three hot-path call sites updated:
+  - `gej_normalize`: `fe_inv` → `fe_inv_var`
+  - `build_odd_multiples_table`: `fe_inv` → `fe_inv_var` (the single batch inversion)
+  - `ecdsa_sig_recover`: `scalar_inverse_var` → `scalar_inv_var`
+- Fermat `fe_inv` and `scalar_inverse_var` retained (used only in tests).
+
+**Performance (50 000 iterations, `--release`):**
+
+| Implementation | Time | vs previous |
+|---|---|---|
+| `ecdsa` (4×64 Solinas) | 52.11 µs | – |
+| `ecdsa_clone` Fermat inversion | 43.67 µs | baseline |
+| `ecdsa_clone` safegcd inversion | **29.06 µs** | 33% faster, 44% faster than Solinas |
+
+**Build:** 13/13 tests pass, commit `eadb8ef`.
