@@ -712,3 +712,23 @@ New module `src/keccak_batch.rs` with `pub fn keccak256_batch(inputs: [&[u8]; 8]
 | gain | **6.18×** | |
 
 **Tests:** 3 new batch tests (empty, various lengths, uniform 64-byte) — all cross-checked against scalar references. 7/7 keccak tests pass.
+
+---
+
+## Prompt: "fix warnings"
+
+**Commit:** `36aaee7` — *fix all compiler warnings (Rust 2024 unsafe_op_in_unsafe_fn, unused import, parens, mut)*
+
+**Effect:** Eliminated all `cargo build --release` warnings across three files. 26/26 tests still pass.
+
+### Root causes and fixes
+
+| File | Warning | Fix |
+|---|---|---|
+| `keccak_batch.rs` | `unused import: keccak256_scalar` inside `mod avx512` | Removed from `use super::{RATE, RC, keccak256_scalar}` |
+| `keccak_batch.rs` | E0133 `unsafe_op_in_unsafe_fn` (17+ intrinsic sites) | Added `#![allow(unsafe_op_in_unsafe_fn)]` at top of `mod avx512` — Rust 2024 edition now denies this by default; wrapping every individual intrinsic in its own `unsafe {}` block would be prohibitively noisy |
+| `modinv64.rs:198` | Unnecessary parentheses: `f.wrapping_add(((…)))` | Removed outer double-paren layer |
+| `ecdsa_clone.rs` | `c1`/`c2` (or `c0`) never read — dead assignments from the last `extract!` invocation in each accumulator chain | Added `#[allow(unused_assignments)]` to `scalar_mul_512` and `scalar_reduce_512`; the trailing write-then-discard pattern is inherent to the sliding-window accumulator algorithm |
+| `ecdsa_clone.rs:1049` | `mut` not needed on `m0`–`m5` | Removed `mut`; variables are write-once (via `extract!` macro) |
+| `ecdsa_clone.rs:1077` | `mut` not needed on `p0`–`p3` | Removed `mut` |
+| `ecdsa_clone.rs:1427` | `mut` not needed on `rz` | Changed `let mut rz` → `let rz` |
