@@ -1317,7 +1317,7 @@ pub fn ge_set_gej_var(a: &Gej) -> Ge {
     if a.infinity {
         return Ge::infinity();
     }
-    let zi = fe_inv(&a.z);
+    let zi = fe_inv_var(&a.z);
     let zi2 = fe_sqr(&zi);
     let zi3 = fe_mul(&zi2, &zi);
     Ge {
@@ -1767,7 +1767,7 @@ fn build_odd_multiples_table(a: &Gej) -> [Ge; TABLE_SIZE] {
     }
 
     // One inversion of the full product.
-    let mut run_inv = fe_inv(&products[TABLE_SIZE - 1]);
+    let mut run_inv = fe_inv_var(&products[TABLE_SIZE - 1]);
     run_inv.normalize();
 
     // Backward pass: derive each z⁻¹ and convert to affine.
@@ -1980,7 +1980,7 @@ pub fn ecdsa_sig_recover(sigr: &Scalar, sigs: &Scalar, message: &Scalar, recid: 
 
     // u1 = -m/r,  u2 = s/r
     // C: $BASE/modules/recovery/main_impl.h lines ~117-120
-    let rn = scalar_inverse_var(sigr);
+    let rn = scalar_inv_var(sigr);
     let mut u1 = scalar_mul(&rn, message);
     u1 = u1.negate();
     let u2 = scalar_mul(&rn, sigs);
