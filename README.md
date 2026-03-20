@@ -1,6 +1,6 @@
 # asmcrypto
 
-[![CI](https://github.com/andy-thomason/asmcrypto/actions/workflows/ci.yml/badge.svg)](https://github.com/andy-thomason/asmcrypto/actions/workflows/ci.yml)
+[![CI](https://github.com/atomicincrement/asmcrypto/actions/workflows/ci.yml/badge.svg)](https://github.com/atomicincrement/asmcrypto/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/asmcrypto.svg)](https://crates.io/crates/asmcrypto)
 [![docs.rs](https://img.shields.io/docsrs/asmcrypto)](https://docs.rs/asmcrypto)
 [![license](https://img.shields.io/crates/l/asmcrypto.svg)](LICENSE-MIT)
