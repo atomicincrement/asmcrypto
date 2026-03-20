@@ -1,7 +1,7 @@
+use asmcrypto::ecdsa_batch::recover_addresses_batch;
 use asmcrypto::ecdsa_scalar::{
     recover_address as our_recover_address, recover_public_key as our_recover_pubkey,
 };
-use asmcrypto::ecdsa_batch::recover_addresses_batch;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 // ─────────────────────────────────────────────────────────────────────────────

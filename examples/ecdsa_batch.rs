@@ -47,8 +47,8 @@ fn main() {
     }
 
     // Cross-check against the scalar implementation.
-    let scalar =
-        asmcrypto::ecdsa_scalar::recover_address(&hash, &r, &s, v).expect("scalar ecrecover failed");
+    let scalar = asmcrypto::ecdsa_scalar::recover_address(&hash, &r, &s, v)
+        .expect("scalar ecrecover failed");
     assert_eq!(
         addresses[0], scalar,
         "batch lane 0 must match scalar ecrecover"
