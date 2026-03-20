@@ -1,6 +1,6 @@
 [package]
 name = "asmcrypto"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Register-parallel cryptographic primitives: 8-lane AVX-512 Keccak-256 batch and secp256k1 ECDSA batch address recovery, outperforming libsecp256k1."
 license = "MIT OR Apache-2.0"

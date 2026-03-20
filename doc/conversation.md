@@ -1198,3 +1198,16 @@ arithmetic in 52-bit IFMA representation, GLV endomorphism, wNAF scalar
 multiplication, batch affine conversion via Montgomery batch inversion, Phase
 1a/1b vectorisation design, invalid-lane handling (§2); planned hand-written
 assembly optimisations and estimated 1.5–2× further speedup (§3).
+
+
+---
+
+## 2026-03-20 — Version bump and crates.io publish
+
+### Prompt
+> update, push and publish the crate
+
+### High-level effects
+- Bumped crate version from `0.1.1` to `0.1.2` in `Cargo.toml`.
+- Recorded this publish step in `doc/conversation.md`.
+- Committed, pushed to `origin/master`, and published to crates.io.
